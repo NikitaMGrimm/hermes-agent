@@ -555,6 +555,23 @@ _LOG_ROTATE_BYTES = 256 * 1024
 
 def main() -> int:
     """Entry point invoked from /etc/cont-init.d/02-reconcile-profiles."""
+    # HERMES_GATEWAY_NO_SUPERVISE is the documented container-wide opt-out
+    # from s6 gateway supervision.  Honour it during boot reconciliation too,
+    # not only when dispatching ``hermes gateway run``.  Derived workspace
+    # containers can intentionally share HERMES_HOME with a dedicated gateway
+    # container; without this guard they all see the same persisted
+    # desired_state=running and each start a gateway for the same bot token.
+    if os.environ.get("HERMES_GATEWAY_NO_SUPERVISE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        print(
+            "reconcile: skipping (gateway supervision disabled by "
+            "HERMES_GATEWAY_NO_SUPERVISE)"
+        )
+        return 0
+
     # A dashboard-only container never spawns or supervises per-profile
     # gateways, so reconciling their s6 slots here is pure waste — and
     # actively harmful: when the gateway and dashboard containers share a
