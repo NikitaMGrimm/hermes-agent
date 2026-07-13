@@ -646,6 +646,36 @@ async def test_send_restart_notification_logs_info_on_sendresult_success(
 
 
 @pytest.mark.asyncio
+async def test_discord_shutdown_notification_routes_only_to_home_channel():
+    runner, adapter = make_restart_runner()
+    discord_config = runner.config.platforms.pop(Platform.TELEGRAM)
+    discord_config.home_channel = HomeChannel(
+        platform=Platform.DISCORD,
+        chat_id="reminders-42",
+        name="Hermes reminders",
+    )
+    discord_config.gateway_restart_notification_active_sessions = False
+    runner.config.platforms[Platform.DISCORD] = discord_config
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    source = make_restart_source(chat_id="legacy-hermes")
+    source.platform = Platform.DISCORD
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="shutdown")
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    adapter.send.assert_awaited_once_with(
+        "reminders-42",
+        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+    )
+
+
+@pytest.mark.asyncio
 async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_missing():
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="parent-42", chat_type="group", thread_id="topic-7")

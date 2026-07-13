@@ -6248,6 +6248,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         platform_str,
                     )
                     continue
+                if (
+                    platform_cfg is not None
+                    and not platform_cfg.gateway_restart_notification_active_sessions
+                ):
+                    logger.info(
+                        "Shutdown notification suppressed for active session: %s has gateway_restart_notification_active_sessions=false",
+                        platform_str,
+                    )
+                    continue
 
                 reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
                 if reply_to_message_id is None and restart_source is not None:

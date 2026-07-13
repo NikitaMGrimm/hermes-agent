@@ -77,6 +77,27 @@ class TestPlatformConfigRoundtrip:
         restored = PlatformConfig.from_dict({"gateway_restart_notification": "false"})
         assert restored.gateway_restart_notification is False
 
+    def test_gateway_restart_notification_active_sessions_defaults_true(self):
+        assert PlatformConfig().gateway_restart_notification_active_sessions is True
+        assert (
+            PlatformConfig.from_dict({}).gateway_restart_notification_active_sessions
+            is True
+        )
+
+    def test_gateway_restart_notification_active_sessions_roundtrip_false(self):
+        pc = PlatformConfig(
+            enabled=True,
+            gateway_restart_notification_active_sessions=False,
+        )
+        restored = PlatformConfig.from_dict(pc.to_dict())
+        assert restored.gateway_restart_notification_active_sessions is False
+
+    def test_gateway_restart_notification_active_sessions_coerces_quoted_false(self):
+        restored = PlatformConfig.from_dict(
+            {"gateway_restart_notification_active_sessions": "false"}
+        )
+        assert restored.gateway_restart_notification_active_sessions is False
+
     def test_typing_indicator_defaults_true(self):
         assert PlatformConfig().typing_indicator is True
         assert PlatformConfig.from_dict({}).typing_indicator is True
@@ -1512,6 +1533,26 @@ class TestLoadGatewayConfig:
             "123": "Research mode",
             "456": "Therapist mode",
         }
+
+    def test_bridges_active_session_restart_notification_from_config_yaml(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "discord:\n"
+            "  gateway_restart_notification_active_sessions: false\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert (
+            config.platforms[Platform.DISCORD].gateway_restart_notification_active_sessions
+            is False
+        )
 
     def test_bridges_discord_history_backfill_settings_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
