@@ -6335,8 +6335,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
         for platform, adapter in list(self.adapters.items()):
-            home = self.config.get_home_channel(platform)
-            if not home or not home.chat_id:
+            lifecycle_target = self.config.get_gateway_restart_notification_channel(
+                platform
+            )
+            if not lifecycle_target or not lifecycle_target.chat_id:
                 continue
 
             platform_cfg = self.config.platforms.get(platform)
@@ -6347,41 +6349,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
-            dedup_key = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
+            dedup_key = (
+                platform.value,
+                str(lifecycle_target.chat_id),
+                str(lifecycle_target.thread_id) if lifecycle_target.thread_id else None,
+            )
             if dedup_key in notified:
                 continue
 
             try:
                 metadata = self._thread_metadata_for_target(
                     platform,
-                    home.chat_id,
-                    home.thread_id,
+                    lifecycle_target.chat_id,
+                    lifecycle_target.thread_id,
                     adapter=adapter,
                 )
                 if metadata:
-                    result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
+                    result = await adapter.send(
+                        str(lifecycle_target.chat_id), msg, metadata=metadata
+                    )
                 else:
-                    result = await adapter.send(str(home.chat_id), msg)
+                    result = await adapter.send(str(lifecycle_target.chat_id), msg)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
-                        "Failed to send shutdown notification to home channel %s:%s: %s",
+                        "Failed to send shutdown notification to home/lifecycle channel %s:%s: %s",
                         platform.value,
-                        home.chat_id,
+                        lifecycle_target.chat_id,
                         getattr(result, "error", "send returned success=False"),
                     )
                     continue
 
                 notified.add(dedup_key)
                 logger.info(
-                    "Sent shutdown notification to home channel %s:%s",
+                    "Sent shutdown notification to home/lifecycle channel %s:%s",
                     platform.value,
-                    home.chat_id,
+                    lifecycle_target.chat_id,
                 )
             except Exception as e:
                 logger.debug(
-                    "Failed to send shutdown notification to home channel %s:%s: %s",
+                    "Failed to send shutdown notification to home/lifecycle channel %s:%s: %s",
                     platform.value,
-                    home.chat_id,
+                    lifecycle_target.chat_id,
                     e,
                 )
 
@@ -16286,10 +16294,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
     ) -> set[tuple[str, str, Optional[str]]]:
-        """Notify configured home channels that the gateway is back online.
+        """Notify configured lifecycle channels that the gateway is back online.
 
         The notification is best-effort and sent once per connected platform
-        home channel. ``skip_targets`` lets startup avoid duplicate messages
+        lifecycle target. ``skip_targets`` lets startup avoid duplicate messages
         when a more specific restart notification is queued for the same chat.
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
@@ -16297,8 +16305,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, adapter in self.adapters.items():
-            home = self.config.get_home_channel(platform)
-            if not home or not home.chat_id:
+            lifecycle_target = self.config.get_gateway_restart_notification_channel(
+                platform
+            )
+            if not lifecycle_target or not lifecycle_target.chat_id:
                 continue
 
             platform_cfg = self.config.platforms.get(platform)
@@ -16309,20 +16319,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
-            target = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
+            target = (
+                platform.value,
+                str(lifecycle_target.chat_id),
+                str(lifecycle_target.thread_id) if lifecycle_target.thread_id else None,
+            )
             if target in skipped or target in delivered:
                 continue
 
             try:
                 metadata = self._thread_metadata_for_target(
                     platform,
-                    home.chat_id,
-                    home.thread_id,
+                    lifecycle_target.chat_id,
+                    lifecycle_target.thread_id,
                     adapter=adapter,
                 )
                 if metadata:
                     result = await adapter.send(
-                        str(home.chat_id),
+                        str(lifecycle_target.chat_id),
                         message,
                         metadata=_non_conversational_metadata(metadata, platform=platform),
                     )
@@ -16330,17 +16344,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _startup_meta = _non_conversational_metadata(platform=platform)
                     if _startup_meta:
                         result = await adapter.send(
-                            str(home.chat_id),
+                            str(lifecycle_target.chat_id),
                             message,
                             metadata=_startup_meta,
                         )
                     else:
-                        result = await adapter.send(str(home.chat_id), message)
+                        result = await adapter.send(
+                            str(lifecycle_target.chat_id), message
+                        )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.warning(
                         "Home-channel startup notification failed for %s:%s: %s",
                         platform.value,
-                        home.chat_id,
+                        lifecycle_target.chat_id,
                         getattr(result, "error", "send returned success=False"),
                     )
                     continue
@@ -16349,13 +16365,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.info(
                     "Sent home-channel startup notification to %s:%s",
                     platform.value,
-                    home.chat_id,
+                    lifecycle_target.chat_id,
                 )
             except Exception as exc:
                 logger.warning(
                     "Home-channel startup notification failed for %s:%s: %s",
                     platform.value,
-                    home.chat_id,
+                    lifecycle_target.chat_id,
                     exc,
                 )
 

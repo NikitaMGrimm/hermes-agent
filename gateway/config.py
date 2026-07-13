@@ -586,6 +586,10 @@ class PlatformConfig:
     # messages belong only in the platform's configured home channel.
     gateway_restart_notification_active_sessions: bool = True
 
+    # Optional destination for administrative gateway lifecycle broadcasts.
+    # When unset, notifications retain the historical home-channel behavior.
+    gateway_restart_notification_channel: Optional[str] = None
+
     # Whether the gateway shows a "typing…" / "is thinking…" status indicator
     # while the agent processes a message on this platform. Default True
     # preserves prior behavior. Set False on platforms where the indicator is
@@ -623,6 +627,10 @@ class PlatformConfig:
         }
         if self.typing_status_text is not None:
             result["typing_status_text"] = self.typing_status_text
+        if self.gateway_restart_notification_channel:
+            result["gateway_restart_notification_channel"] = (
+                self.gateway_restart_notification_channel
+            )
         if self.token:
             result["token"] = self.token
         if self.api_key:
@@ -655,6 +663,10 @@ class PlatformConfig:
         if _grn_active is None:
             _grn_active = extra.get("gateway_restart_notification_active_sessions")
 
+        _grn_channel = data.get("gateway_restart_notification_channel")
+        if _grn_channel is None:
+            _grn_channel = extra.get("gateway_restart_notification_channel")
+
         # typing_indicator mirrors gateway_restart_notification: it may arrive
         # top-level or bridged into extra by the shared-key loop in
         # load_gateway_config(), so check both.
@@ -684,6 +696,9 @@ class PlatformConfig:
             gateway_restart_notification=_coerce_bool(_grn, True),
             gateway_restart_notification_active_sessions=_coerce_bool(
                 _grn_active, True
+            ),
+            gateway_restart_notification_channel=(
+                str(_grn_channel) if _grn_channel not in (None, "") else None
             ),
             typing_indicator=_coerce_bool(_typing, True),
             typing_status_text=_typing_text,
@@ -985,6 +1000,21 @@ class GatewayConfig:
         if config:
             return config.home_channel
         return None
+
+    def get_gateway_restart_notification_channel(
+        self, platform: Platform
+    ) -> Optional[HomeChannel]:
+        """Resolve the lifecycle notification target, falling back to home."""
+        config = self.platforms.get(platform)
+        if not config:
+            return None
+        if config.gateway_restart_notification_channel:
+            return HomeChannel(
+                platform=platform,
+                chat_id=config.gateway_restart_notification_channel,
+                name="Gateway lifecycle notifications",
+            )
+        return config.home_channel
     
     def get_reset_policy(
         self, 
@@ -1511,6 +1541,10 @@ def load_gateway_config() -> GatewayConfig:
                 if "gateway_restart_notification_active_sessions" in platform_cfg:
                     bridged["gateway_restart_notification_active_sessions"] = (
                         platform_cfg["gateway_restart_notification_active_sessions"]
+                    )
+                if "gateway_restart_notification_channel" in platform_cfg:
+                    bridged["gateway_restart_notification_channel"] = (
+                        platform_cfg["gateway_restart_notification_channel"]
                     )
                 if "typing_indicator" in platform_cfg:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]

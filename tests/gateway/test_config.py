@@ -98,6 +98,20 @@ class TestPlatformConfigRoundtrip:
         )
         assert restored.gateway_restart_notification_active_sessions is False
 
+    def test_gateway_restart_notification_channel_defaults_none(self):
+        assert PlatformConfig().gateway_restart_notification_channel is None
+        assert PlatformConfig.from_dict({}).gateway_restart_notification_channel is None
+
+    def test_gateway_restart_notification_channel_roundtrip(self):
+        pc = PlatformConfig(
+            enabled=True,
+            gateway_restart_notification_channel="automation-log-42",
+        )
+        restored = PlatformConfig.from_dict(pc.to_dict())
+        assert (
+            restored.gateway_restart_notification_channel == "automation-log-42"
+        )
+
     def test_typing_indicator_defaults_true(self):
         assert PlatformConfig().typing_indicator is True
         assert PlatformConfig.from_dict({}).typing_indicator is True
@@ -1552,6 +1566,26 @@ class TestLoadGatewayConfig:
         assert (
             config.platforms[Platform.DISCORD].gateway_restart_notification_active_sessions
             is False
+        )
+
+    def test_bridges_restart_notification_channel_from_config_yaml(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "discord:\n"
+            "  gateway_restart_notification_channel: automation-log-42\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert (
+            config.platforms[Platform.DISCORD].gateway_restart_notification_channel
+            == "automation-log-42"
         )
 
     def test_bridges_discord_history_backfill_settings_from_config_yaml(self, tmp_path, monkeypatch):
