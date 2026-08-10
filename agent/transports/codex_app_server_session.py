@@ -36,6 +36,7 @@ from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
+    CodexAppServerTransportError,
 )
 from agent.transports.codex_event_projector import CodexEventProjector
 
@@ -428,7 +429,11 @@ class CodexAppServerSession:
                 },
                 timeout=10,
             )
-        except (CodexAppServerError, TimeoutError):
+        except (
+            CodexAppServerError,
+            CodexAppServerTransportError,
+            TimeoutError,
+        ):
             logger.debug("turn/steer rejected for active Codex turn", exc_info=True)
             return False
         accepted_turn_id = response.get("turnId") if isinstance(response, dict) else None
@@ -501,7 +506,11 @@ class CodexAppServerSession:
         result = TurnResult()
         try:
             self.ensure_started()
-        except (CodexAppServerError, TimeoutError) as exc:
+        except (
+            CodexAppServerError,
+            CodexAppServerTransportError,
+            TimeoutError,
+        ) as exc:
             result.error = self._format_error_with_stderr(
                 "codex app-server startup failed", exc
             )
@@ -559,6 +568,13 @@ class CodexAppServerSession:
             hint = _classify_oauth_failure(stderr_blob)
             result.error = hint or self._format_error_with_stderr(
                 "turn/start timed out", exc
+            )
+            result.should_retire = True
+            self._interrupt_event.clear()
+            return result
+        except CodexAppServerTransportError as exc:
+            result.error = self._format_error_with_stderr(
+                "turn/start transport failed", exc
             )
             result.should_retire = True
             self._interrupt_event.clear()
@@ -812,7 +828,11 @@ class CodexAppServerSession:
         result = TurnResult()
         try:
             self.ensure_started()
-        except (CodexAppServerError, TimeoutError) as exc:
+        except (
+            CodexAppServerError,
+            CodexAppServerTransportError,
+            TimeoutError,
+        ) as exc:
             result.error = self._format_error_with_stderr(
                 "codex app-server startup failed", exc
             )
@@ -846,6 +866,12 @@ class CodexAppServerSession:
             hint = _classify_oauth_failure(stderr_blob)
             result.error = hint or self._format_error_with_stderr(
                 "thread/compact/start timed out", exc
+            )
+            result.should_retire = True
+            return result
+        except CodexAppServerTransportError as exc:
+            result.error = self._format_error_with_stderr(
+                "thread/compact/start transport failed", exc
             )
             result.should_retire = True
             return result
@@ -1002,6 +1028,8 @@ class CodexAppServerSession:
             logger.debug("turn/interrupt non-fatal: %s", exc)
         except TimeoutError:
             logger.warning("turn/interrupt timed out")
+        except CodexAppServerTransportError:
+            logger.debug("turn/interrupt transport unavailable", exc_info=True)
 
     def _handle_server_request(self, req: dict) -> None:
         """Translate a codex server request (approval) into Hermes' approval
