@@ -166,6 +166,9 @@ COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/loc
 # See node_source stage at the top of the file for the version-bump
 # rationale (#4977).
 COPY --chmod=0755 --from=node_source /usr/local/bin/node /usr/local/bin/
+# A custom runtime base may already contain npm. Docker COPY merges directories,
+# so remove any older npm tree first rather than producing a mixed installation.
+RUN rm -rf /usr/local/lib/node_modules/npm
 COPY --from=node_source /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
