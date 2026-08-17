@@ -350,6 +350,17 @@ def _is_legacy_gateway_run_request(argv: Sequence[str]) -> bool:
     return len(args) >= 2 and args[0] == "gateway" and args[1] == "run"
 
 
+def _is_no_supervise_gateway_run_request(argv: Sequence[str]) -> bool:
+    """Return True when the container command opts out of gateway supervision."""
+    args = _strip_container_argv_prefix(argv)
+    return (
+        len(args) >= 3
+        and args[0] == "gateway"
+        and args[1] == "run"
+        and "--no-supervise" in args[2:]
+    )
+
+
 def _is_dashboard_container(argv: Sequence[str]) -> bool:
     """Return True when the container's command is the dashboard.
 
@@ -582,6 +593,31 @@ _LOG_ROTATE_BYTES = 256 * 1024
 
 def main() -> int:
     """Entry point invoked from /etc/cont-init.d/02-reconcile-profiles."""
+    # The environment variable is a container-wide opt-out from s6 gateway
+    # supervision. Honour it during boot reconciliation too, not only when
+    # dispatching ``hermes gateway run``. Check it before reading /proc so the
+    # documented container-wide escape hatch remains independent of argv
+    # discovery. A direct ``gateway run --no-supervise`` command has the same
+    # meaning and is checked below.
+    if os.environ.get("HERMES_GATEWAY_NO_SUPERVISE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        print(
+            "reconcile: skipping (gateway supervision disabled by "
+            "HERMES_GATEWAY_NO_SUPERVISE)"
+        )
+        return 0
+
+    container_argv = _read_container_argv()
+    if _is_no_supervise_gateway_run_request(container_argv):
+        print(
+            "reconcile: skipping (gateway supervision disabled by "
+            "--no-supervise)"
+        )
+        return 0
+
     # A dashboard-only container never spawns or supervises per-profile
     # gateways, so reconciling their s6 slots here is pure waste — and
     # actively harmful: when the gateway and dashboard containers share a
@@ -591,7 +627,7 @@ def main() -> int:
     # skip reconciliation in the dashboard container. No operator flag:
     # the role is a fact about the container's command, and a flag can be
     # forgotten in a hand-written manifest, reintroducing the storm.
-    if _is_dashboard_container(_read_container_argv()):
+    if _is_dashboard_container(container_argv):
         print(
             "reconcile: skipping (dashboard container — does not need "
             "per-profile gateways)"

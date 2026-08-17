@@ -208,6 +208,29 @@ async def test_send_home_channel_startup_notification_preserves_thread_metadata(
 
 
 @pytest.mark.asyncio
+async def test_send_startup_notification_to_lifecycle_channel(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    platform_config = runner.config.platforms[Platform.TELEGRAM]
+    platform_config.home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    platform_config.gateway_restart_notification_channel = "automation-log-42"
+    adapter.send = AsyncMock()
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == {("telegram", "automation-log-42", None)}
+    adapter.send.assert_called_once_with(
+        "automation-log-42",
+        "♻️ Gateway online — Hermes is back and ready.",
+    )
+
+
+@pytest.mark.asyncio
 async def test_relay_fronted_logical_home_gets_startup_notification(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
@@ -412,4 +435,27 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
 
     adapter.send.assert_not_awaited()
 
+
+@pytest.mark.asyncio
+async def test_active_session_shutdown_suppression_preserves_home_broadcast():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="active-42")
+    session_key = build_session_key(source)
+
+    runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification_active_sessions = False
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="shutdown"))
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    adapter.send.assert_awaited_once_with(
+        "home-42",
+        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+    )
 

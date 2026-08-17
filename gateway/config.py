@@ -656,6 +656,15 @@ class PlatformConfig:
     # noise; keep True for back-channels where the operator wants them.
     gateway_restart_notification: bool = True
 
+    # Whether shutdown notifications are also sent to each active session's
+    # origin. Disable this when administrative lifecycle messages belong only
+    # in the platform's configured home/lifecycle channel.
+    gateway_restart_notification_active_sessions: bool = True
+
+    # Optional destination for administrative gateway lifecycle broadcasts.
+    # When unset, notifications retain the historical home-channel behavior.
+    gateway_restart_notification_channel: Optional[str] = None
+
     # Whether the gateway shows a "typing…" / "is thinking…" status indicator
     # while the agent processes a message on this platform. Default True
     # preserves prior behavior. Set False on platforms where the indicator is
@@ -686,10 +695,15 @@ class PlatformConfig:
             "extra": self.extra,
             "reply_to_mode": self.reply_to_mode,
             "gateway_restart_notification": self.gateway_restart_notification,
+            "gateway_restart_notification_active_sessions": (
+                self.gateway_restart_notification_active_sessions
+            ),
             "typing_indicator": self.typing_indicator,
         }
         if self.typing_status_text is not None:
             result["typing_status_text"] = self.typing_status_text
+        if self.gateway_restart_notification_channel:
+            result["gateway_restart_notification_channel"] = self.gateway_restart_notification_channel
         if self.token:
             result["token"] = self.token
         if self.api_key:
@@ -718,6 +732,16 @@ class PlatformConfig:
         if _grn is None:
             _grn = extra.get("gateway_restart_notification")
 
+        _grn_active = data.get("gateway_restart_notification_active_sessions")
+        if _grn_active is None:
+            _grn_active = extra.get("gateway_restart_notification_active_sessions")
+
+        _grn_channel = data.get("gateway_restart_notification_channel")
+        if _grn_channel is None:
+            _grn_channel = extra.get("gateway_restart_notification_channel")
+        if _grn_channel not in (None, ""):
+            _grn_channel = str(_grn_channel)
+
         # typing_indicator mirrors gateway_restart_notification: it may arrive
         # top-level or bridged into extra by the shared-key loop in
         # load_gateway_config(), so check both.
@@ -745,6 +769,10 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
+            gateway_restart_notification_active_sessions=_coerce_bool(
+                _grn_active, True
+            ),
+            gateway_restart_notification_channel=_grn_channel,
             typing_indicator=_coerce_bool(_typing, True),
             typing_status_text=_typing_text,
             channel_overrides=channel_overrides,
@@ -1076,6 +1104,34 @@ class GatewayConfig:
         if config:
             return config.home_channel
         return None
+
+    def get_gateway_restart_notification_channel(
+        self, platform: Platform
+    ) -> Optional[HomeChannel]:
+        """Resolve the lifecycle broadcast target, falling back to home.
+
+        A configured lifecycle channel replaces only the chat ID. Relay
+        identity metadata is inherited from the platform home target, while a
+        home thread is retained only when the lifecycle target is the home chat.
+        """
+        config = self.platforms.get(platform)
+        if not config:
+            return None
+        raw_target = config.gateway_restart_notification_channel
+        home = config.home_channel
+        if not raw_target:
+            return home
+
+        target_chat_id = str(raw_target)
+        same_home = home is not None and str(home.chat_id) == target_chat_id
+        return HomeChannel(
+            platform=platform,
+            chat_id=target_chat_id,
+            name="Gateway lifecycle notifications",
+            thread_id=home.thread_id if same_home and home else None,
+            user_id=home.user_id if home else None,
+            scope_id=home.scope_id if home else None,
+        )
     
     def get_reset_policy(
         self, 
@@ -1664,6 +1720,14 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = channel_prompts
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
+                if "gateway_restart_notification_active_sessions" in platform_cfg:
+                    bridged["gateway_restart_notification_active_sessions"] = (
+                        platform_cfg["gateway_restart_notification_active_sessions"]
+                    )
+                if "gateway_restart_notification_channel" in platform_cfg:
+                    bridged["gateway_restart_notification_channel"] = (
+                        platform_cfg["gateway_restart_notification_channel"]
+                    )
                 if "typing_indicator" in platform_cfg:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:

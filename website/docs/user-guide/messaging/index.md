@@ -700,10 +700,19 @@ gateway:
       gateway_restart_notification: false   # opt out for this platform
     discord:
       home_chat_id: "987654321"
+      gateway_restart_notification_active_sessions: false  # keep notices in the lifecycle channel only
+      gateway_restart_notification_channel: "123456789"    # optional; defaults to the home channel
       # gateway_restart_notification omitted → defaults to true
 ```
 
 Disable it on noisy or low-priority platforms while leaving it on for your primary chat. The notification is sent once per restart, regardless of how many sessions were in flight.
+
+Set `gateway_restart_notification_active_sessions: false` when active task chats
+should not receive shutdown notices, while the configured home/lifecycle channel
+still receives the administrative broadcast. Set
+`gateway_restart_notification_channel` to a platform chat ID to keep lifecycle
+broadcasts separate from the home conversation; when omitted, the home channel
+is used.
 
 ### Typing indicators
 

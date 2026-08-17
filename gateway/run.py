@@ -10430,6 +10430,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         platform_str,
                     )
                     continue
+                if (
+                    platform_cfg is not None
+                    and not platform_cfg.gateway_restart_notification_active_sessions
+                ):
+                    logger.info(
+                        "Shutdown notification suppressed for active session: %s has "
+                        "gateway_restart_notification_active_sessions=false",
+                        platform_str,
+                    )
+                    continue
 
                 reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
                 if reply_to_message_id is None and restart_source is not None:
@@ -10502,59 +10512,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # fail toward the louder, more-visible behaviour.
             logger.debug("drain_notification_suppressed check failed: %s", e)
 
-        # Snapshot adapters up front: adapter.send() can hit a fatal error
-        # path that pops the adapter from self.adapters (see _handle_fatal
-        # elsewhere), which would otherwise trigger
-        # ``RuntimeError: dictionary changed size during iteration`` —
-        # observed in a user report during gateway shutdown.
-        for platform, adapter in list(self.adapters.items()):
-            home = self.config.get_home_channel(platform)
-            if not home or not home.chat_id:
+        # Iterate logical configured platforms, not physical adapters. A
+        # platform may be fronted by the upstream Relay adapter after a
+        # restart, so resolving through the shared transport path is required
+        # for lifecycle delivery to work without an inbound chat cache.
+        for platform, platform_cfg in list(self.config.platforms.items()):
+            lifecycle_target = self.config.get_gateway_restart_notification_channel(
+                platform
+            )
+            if not lifecycle_target or not lifecycle_target.chat_id:
                 continue
 
-            platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+            if not platform_cfg.gateway_restart_notification:
                 logger.info(
-                    "Shutdown notification suppressed for home channel: %s has gateway_restart_notification=false",
+                    "Shutdown notification suppressed for home/lifecycle channel: %s has "
+                    "gateway_restart_notification=false",
                     platform.value,
                 )
                 continue
 
-            dedup_key = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
+            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            if transport is None:
+                continue
+
+            dedup_key = (
+                platform.value,
+                str(lifecycle_target.chat_id),
+                str(lifecycle_target.thread_id)
+                if lifecycle_target.thread_id
+                else None,
+            )
             if dedup_key in notified:
                 continue
 
             try:
                 metadata = self._thread_metadata_for_target(
                     platform,
-                    home.chat_id,
-                    home.thread_id,
-                    adapter=adapter,
+                    lifecycle_target.chat_id,
+                    lifecycle_target.thread_id,
+                    adapter=transport.adapter,
                 )
-                if metadata:
-                    result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
+                if transport.is_relay:
+                    metadata = dict(metadata or {})
+                    if lifecycle_target.user_id:
+                        metadata["user_id"] = lifecycle_target.user_id
+                    if lifecycle_target.scope_id:
+                        metadata["scope_id"] = lifecycle_target.scope_id
+                send_metadata = _non_conversational_metadata(
+                    metadata, platform=platform
+                )
+                if send_metadata is not None or transport.is_relay:
+                    result = await transport.send(
+                        platform,
+                        str(lifecycle_target.chat_id),
+                        msg,
+                        metadata=send_metadata,
+                    )
                 else:
-                    result = await adapter.send(str(home.chat_id), msg)
+                    result = await transport.adapter.send(
+                        str(lifecycle_target.chat_id), msg
+                    )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
-                        "Failed to send shutdown notification to home channel %s:%s: %s",
+                        "Failed to send shutdown notification to home/lifecycle channel %s:%s: %s",
                         platform.value,
-                        home.chat_id,
+                        lifecycle_target.chat_id,
                         getattr(result, "error", "send returned success=False"),
                     )
                     continue
 
                 notified.add(dedup_key)
                 logger.info(
-                    "Sent shutdown notification to home channel %s:%s",
+                    "Sent shutdown notification to home/lifecycle channel %s:%s",
                     platform.value,
-                    home.chat_id,
+                    lifecycle_target.chat_id,
                 )
             except Exception as e:
                 logger.debug(
-                    "Failed to send shutdown notification to home channel %s:%s: %s",
+                    "Failed to send shutdown notification to home/lifecycle channel %s:%s: %s",
                     platform.value,
-                    home.chat_id,
+                    lifecycle_target.chat_id,
                     e,
                 )
 
@@ -23763,10 +23800,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
     ) -> set[tuple[str, str, Optional[str]]]:
-        """Notify configured home channels that the gateway is back online.
+        """Notify configured lifecycle channels that the gateway is back online.
 
         The notification is best-effort and sent once per connected platform
-        home channel. ``skip_targets`` lets startup avoid duplicate messages
+        lifecycle target. ``skip_targets`` lets startup avoid duplicate messages
         when a more specific restart notification is queued for the same chat.
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
@@ -23774,8 +23811,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, platform_cfg in self.config.platforms.items():
-            home = platform_cfg.home_channel
-            if not home or not home.chat_id:
+            lifecycle_target = self.config.get_gateway_restart_notification_channel(
+                platform
+            )
+            if not lifecycle_target or not lifecycle_target.chat_id:
                 continue
 
             transport = resolve_delivery_transport(platform, self.config, self.adapters)
@@ -23784,58 +23823,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if not platform_cfg.gateway_restart_notification:
                 logger.info(
-                    "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
+                    "Lifecycle startup notification suppressed: %s has "
+                    "gateway_restart_notification=false",
                     platform.value,
                 )
                 continue
 
-            target = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
+            target = (
+                platform.value,
+                str(lifecycle_target.chat_id),
+                str(lifecycle_target.thread_id)
+                if lifecycle_target.thread_id
+                else None,
+            )
             if target in skipped or target in delivered:
                 continue
 
             try:
                 metadata = self._thread_metadata_for_target(
                     platform,
-                    home.chat_id,
-                    home.thread_id,
+                    lifecycle_target.chat_id,
+                    lifecycle_target.thread_id,
                     adapter=transport.adapter,
                 )
                 if transport.is_relay:
                     metadata = dict(metadata or {})
-                    if home.user_id:
-                        metadata["user_id"] = home.user_id
-                    if home.scope_id:
-                        metadata["scope_id"] = home.scope_id
+                    if lifecycle_target.user_id:
+                        metadata["user_id"] = lifecycle_target.user_id
+                    if lifecycle_target.scope_id:
+                        metadata["scope_id"] = lifecycle_target.scope_id
                 send_metadata = _non_conversational_metadata(metadata, platform=platform)
                 if send_metadata is not None or transport.is_relay:
                     result = await transport.send(
                         platform,
-                        str(home.chat_id),
+                        str(lifecycle_target.chat_id),
                         message,
                         metadata=send_metadata,
                     )
                 else:
-                    result = await transport.adapter.send(str(home.chat_id), message)
+                    result = await transport.adapter.send(
+                        str(lifecycle_target.chat_id), message
+                    )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.warning(
-                        "Home-channel startup notification failed for %s:%s: %s",
+                        "Lifecycle startup notification failed for %s:%s: %s",
                         platform.value,
-                        home.chat_id,
+                        lifecycle_target.chat_id,
                         getattr(result, "error", "send returned success=False"),
                     )
                     continue
 
                 delivered.add(target)
                 logger.info(
-                    "Sent home-channel startup notification to %s:%s",
+                    "Sent lifecycle startup notification to %s:%s",
                     platform.value,
-                    home.chat_id,
+                    lifecycle_target.chat_id,
                 )
             except Exception as exc:
                 logger.warning(
-                    "Home-channel startup notification failed for %s:%s: %s",
+                    "Lifecycle startup notification failed for %s:%s: %s",
                     platform.value,
-                    home.chat_id,
+                    lifecycle_target.chat_id,
                     exc,
                 )
 

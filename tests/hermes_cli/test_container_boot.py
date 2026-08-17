@@ -286,6 +286,77 @@ def test_main_skips_reconcile_in_dashboard_container_s6v3(
     assert "skipping (dashboard container" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("value", ["1", "true", "yes", "TRUE"])
+def test_main_skips_reconcile_when_gateway_supervision_is_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    value: str,
+) -> None:
+    """The container-wide no-supervise env opt-out applies during boot."""
+    from hermes_cli import container_boot
+
+    scandir = tmp_path / "run-service"
+    scandir.mkdir()
+    _make_profile(tmp_path, "worker", state="running")
+    _seed_default_root(tmp_path, state="running")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("S6_PROFILE_GATEWAY_SCANDIR", str(scandir))
+    monkeypatch.setenv("HERMES_GATEWAY_NO_SUPERVISE", value)
+    monkeypatch.setattr(
+        container_boot,
+        "_read_container_argv",
+        lambda: (
+            "/init",
+            "/opt/hermes/docker/main-wrapper.sh",
+            "/usr/local/bin/code-server",
+        ),
+    )
+
+    rc = container_boot.main()
+
+    assert rc == 0
+    assert not (scandir / "gateway-worker").exists()
+    assert not (scandir / "gateway-default").exists()
+    assert "skipping (gateway supervision disabled" in capsys.readouterr().out
+
+
+def test_main_skips_reconcile_for_gateway_run_no_supervise_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The CLI flag equivalent must protect boot reconciliation too."""
+    from hermes_cli import container_boot
+
+    scandir = tmp_path / "run-service"
+    scandir.mkdir()
+    _make_profile(tmp_path, "worker", state="running")
+    _seed_default_root(tmp_path, state="running")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("S6_PROFILE_GATEWAY_SCANDIR", str(scandir))
+    monkeypatch.delenv("HERMES_GATEWAY_NO_SUPERVISE", raising=False)
+    monkeypatch.setattr(
+        container_boot,
+        "_read_container_argv",
+        lambda: (
+            "/bin/sh",
+            "-e",
+            "/run/s6/basedir/scripts/rc.init",
+            "top",
+            "/opt/hermes/docker/main-wrapper.sh",
+            "gateway",
+            "run",
+            "--no-supervise",
+        ),
+    )
+
+    rc = container_boot.main()
+
+    assert rc == 0
+    assert not (scandir / "gateway-worker").exists()
+    assert not (scandir / "gateway-default").exists()
+    assert "skipping (gateway supervision disabled" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +368,6 @@ def _write_lifecycle_sentinel(profile_dir: Path, payload: dict) -> None:
     state_dir = profile_dir / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "gateway.lifecycle.json").write_text(json.dumps(payload))
-
 
 
 

@@ -83,6 +83,82 @@ class TestPlatformConfigRoundtrip:
         restored = PlatformConfig.from_dict(pc.to_dict())
         assert restored.gateway_restart_notification is False
 
+    def test_active_session_restart_notification_defaults_true(self):
+        assert PlatformConfig().gateway_restart_notification_active_sessions is True
+        assert (
+            PlatformConfig.from_dict({}).gateway_restart_notification_active_sessions
+            is True
+        )
+
+    def test_active_session_restart_notification_roundtrip_false(self):
+        pc = PlatformConfig(
+            enabled=True,
+            gateway_restart_notification_active_sessions=False,
+        )
+        restored = PlatformConfig.from_dict(pc.to_dict())
+        assert restored.gateway_restart_notification_active_sessions is False
+
+    def test_active_session_restart_notification_coerces_quoted_false(self):
+        restored = PlatformConfig.from_dict(
+            {"gateway_restart_notification_active_sessions": "false"}
+        )
+        assert restored.gateway_restart_notification_active_sessions is False
+
+    def test_restart_notification_channel_roundtrip(self):
+        pc = PlatformConfig(
+            enabled=True,
+            gateway_restart_notification_channel="automation-log-42",
+        )
+        restored = PlatformConfig.from_dict(pc.to_dict())
+        assert restored.gateway_restart_notification_channel == "automation-log-42"
+
+    def test_restart_notification_channel_resolves_before_home(self):
+        home = HomeChannel(
+            platform=Platform.DISCORD,
+            chat_id="home-42",
+            name="Ops Home",
+        )
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    home_channel=home,
+                    gateway_restart_notification_channel="automation-log-42",
+                )
+            }
+        )
+
+        target = config.get_gateway_restart_notification_channel(Platform.DISCORD)
+
+        assert target is not None
+        assert target.chat_id == "automation-log-42"
+        assert target.platform is Platform.DISCORD
+        assert config.get_gateway_restart_notification_channel(Platform.TELEGRAM) is None
+
+    def test_restart_notification_channel_string_preserves_relay_identity(self):
+        home = HomeChannel(
+            platform=Platform.SLACK,
+            chat_id="home-42",
+            name="Owner DM",
+            thread_id="thread-home",
+            user_id="user-42",
+            scope_id="team-42",
+        )
+        config = GatewayConfig(
+            platforms={
+                Platform.SLACK: PlatformConfig(
+                    home_channel=home,
+                    gateway_restart_notification_channel="lifecycle-42",
+                )
+            }
+        )
+
+        target = config.get_gateway_restart_notification_channel(Platform.SLACK)
+
+        assert target is not None
+        assert target.chat_id == "lifecycle-42"
+        assert target.thread_id is None
+        assert target.user_id == "user-42"
+        assert target.scope_id == "team-42"
 
     def test_typing_status_text_resolved_from_extra(self):
         # Same bridge route as typing_indicator: the shared-key loop copies a
@@ -640,6 +716,25 @@ class TestLoadGatewayConfig:
         config = load_gateway_config()
 
         assert config.unauthorized_dm_behavior == "ignore"
+
+    def test_bridges_restart_notification_controls_from_config_yaml(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "discord:\n"
+            "  gateway_restart_notification_active_sessions: false\n"
+            "  gateway_restart_notification_channel: automation-log-42\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        discord = config.platforms[Platform.DISCORD]
+        assert discord.gateway_restart_notification_active_sessions is False
+        assert discord.gateway_restart_notification_channel == "automation-log-42"
 
 
     def test_present_empty_top_level_session_reset_blocks_nested_fallback(self, tmp_path, monkeypatch):
