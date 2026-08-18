@@ -148,7 +148,8 @@ that upstream still lacks.
   authorship from upstream open PR
   [#83129](https://github.com/NousResearch/hermes-agent/pull/83129), plus fork
   hardening commits `f622c0aa34f5eef63f74f13294bfa25ab2581ec2` and
-  `5428602b52bb79fe1339caf7224b9d9bd1767eef`.
+  `5428602b52bb79fe1339caf7224b9d9bd1767eef`, plus lifecycle hardening commit
+  `83234966b7b398a418fd11d17bba58c88ccd68bc`.
 - **Ownership:** temporarily carried until upstream provides the complete
   behavior. The fork hardening closes serialization, generic pipe-I/O,
   interrupt, compaction, and in-flight steer/finalization gaps discovered
@@ -157,12 +158,23 @@ that upstream still lacks.
   clean their pending RPC state without killing a healthy transport. Every
   actual App Server write failure is typed as a transport failure, clears the
   pending request, and makes the affected runtime or session non-reusable.
+  Concurrent request, response, steer, and approval writes remain distinct
+  complete JSON-RPC frames, including when the pipe accepts short writes.
   Response, steer, interrupt, compaction, and finalization paths propagate the
   retirement decision so the next turn starts a fresh App Server process.
+  Agent and session interrupt state share one ordered claim boundary so a stop
+  cannot be lost or leak into the next turn. Normal turns and native compaction
+  remain attached for 6,000 seconds rather than detaching after ten minutes
+  while Codex continues working.
 - **Removal:** pure upstream must pass
   `tests/agent/transports/test_codex_app_server_runtime.py` and
   `tests/agent/transports/test_codex_app_server_session.py`, including circular
-  serialization, `BrokenPipeError` and generic `OSError` writes, pending-state
-  cleanup, response write failure, steer/finalization races, interrupt failure,
-  and compaction failure. Also reproduce the original gateway symptom and
-  verify that the failed session is retired before the following turn.
+  serialization, `BrokenPipeError` and generic `OSError` writes, short and
+  concurrent writes, pending-state cleanup, response write failure,
+  steer/finalization races, interrupt failure, compaction failure, and the
+  6,000-second default deadline. Pure upstream must also pass
+  `tests/agent/test_codex_app_server_persist.py`,
+  `tests/agent/test_interrupt_compat.py`, and
+  `tests/run_agent/test_codex_app_server_integration.py`. Reproduce the
+  original gateway symptom and verify that the failed session is retired
+  before the following turn.
