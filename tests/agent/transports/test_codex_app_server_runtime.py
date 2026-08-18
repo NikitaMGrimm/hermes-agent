@@ -149,6 +149,52 @@ class TestCodexAppServerModule:
         assert isinstance(exc.value, RuntimeError)
         assert client._pending == {}
 
+    def test_request_serialization_value_error_clears_pending(self) -> None:
+        from agent.transports.codex_app_server import (
+            CodexAppServerClient,
+            CodexAppServerTransportError,
+        )
+
+        client = object.__new__(CodexAppServerClient)
+        client._next_id = 1
+        client._pending = {}
+        client._pending_lock = threading.Lock()
+        client._closed = False
+        client._proc = type("Proc", (), {"stdin": object()})()
+        circular: dict = {}
+        circular["self"] = circular
+
+        with pytest.raises(ValueError, match="Circular reference") as exc:
+            client.request("turn/start", circular)
+
+        assert not isinstance(exc.value, CodexAppServerTransportError)
+        assert client._pending == {}
+
+    def test_request_os_write_failure_is_typed_and_clears_pending(self) -> None:
+        from agent.transports.codex_app_server import (
+            CodexAppServerClient,
+            CodexAppServerTransportError,
+        )
+
+        class BrokenStdin:
+            def write(self, _payload: bytes) -> None:
+                raise OSError("bad file descriptor")
+
+            def flush(self) -> None:
+                raise AssertionError("flush should not follow a failed write")
+
+        client = object.__new__(CodexAppServerClient)
+        client._next_id = 1
+        client._pending = {}
+        client._pending_lock = threading.Lock()
+        client._closed = False
+        client._proc = type("Proc", (), {"stdin": BrokenStdin()})()
+
+        with pytest.raises(CodexAppServerTransportError, match="bad file descriptor"):
+            client.request("turn/start", {})
+
+        assert client._pending == {}
+
 
 class TestSpawnEnvIsolation:
     """The codex spawn must NOT rewrite HOME — codex's shell tool spawns
