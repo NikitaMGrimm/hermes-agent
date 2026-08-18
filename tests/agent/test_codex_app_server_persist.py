@@ -24,6 +24,7 @@ duplicate the user turn (#860 / #42039). This test locks in:
 """
 
 import tempfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -145,6 +146,86 @@ def test_codex_late_interrupt_reconciles_completed_session_result():
     assert result["interrupted"] is True
     assert result["interrupt_message"] == "stop at completion"
     assert agent._interrupt_requested is False
+
+
+def test_turn_start_failure_interrupt_does_not_poison_following_runtime_turn():
+    """A stop racing a failed turn/start belongs only to that logical turn."""
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://stub.invalid",
+        provider="openai",
+        api_mode="codex_app_server",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    class RacingTurnStartSession:
+        def __init__(self):
+            self.interrupt_event = threading.Event()
+            self.run_calls = 0
+
+        def request_interrupt(self):
+            self.interrupt_event.set()
+
+        def consume_interrupt_request(self):
+            was_set = self.interrupt_event.is_set()
+            self.interrupt_event.clear()
+            return was_set
+
+        def run_turn(self, *, user_input):
+            self.run_calls += 1
+            if self.run_calls == 1:
+                # Model CodexAppServerSession's caught turn/start failure: the
+                # session reports an interrupted error result while the agent's
+                # durable interrupt flag is still awaiting boundary cleanup.
+                agent.interrupt("stop during turn/start")
+                return SimpleNamespace(
+                    interrupted=True,
+                    error="turn/start failed: synthetic failure",
+                    thread_id="thread-1",
+                    turn_id=None,
+                    projected_messages=[],
+                    tool_iterations=0,
+                    final_text="",
+                    should_retire=False,
+                )
+            return _make_turn()
+
+        def close(self):
+            pass
+
+    session = RacingTurnStartSession()
+    agent._codex_session = session
+    agent._codex_session_runtime_key = (None, None)
+
+    failed = run_codex_app_server_turn(
+        agent,
+        user_message="first turn",
+        original_user_message="first turn",
+        messages=[{"role": "user", "content": "first turn"}],
+        effective_task_id="task-1",
+    )
+
+    assert failed["interrupted"] is True
+    assert failed["interrupt_message"] == "stop during turn/start"
+    assert agent._interrupt_requested is False
+    assert session.interrupt_event.is_set() is False
+
+    succeeded = run_codex_app_server_turn(
+        agent,
+        user_message="second turn",
+        original_user_message="second turn",
+        messages=[{"role": "user", "content": "second turn"}],
+        effective_task_id="task-2",
+    )
+
+    assert succeeded["completed"] is True
+    assert succeeded["interrupted"] is False
+    assert succeeded["final_response"] == "CODEX_ASSISTANT"
+    assert session.run_calls == 2
+    assert agent._interrupt_requested is False
+    assert session.interrupt_event.is_set() is False
 
 
 def test_codex_interrupt_preserved_after_compaction_skips_next_turn():
