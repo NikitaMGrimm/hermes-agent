@@ -228,7 +228,7 @@ class CodexAppServerClient:
             self._pending[rid] = _Pending(queue=q, method=method)
         try:
             self._send({"id": rid, "method": method, "params": params or {}})
-        except CodexAppServerTransportError:
+        except Exception:
             with self._pending_lock:
                 self._pending.pop(rid, None)
             raise
@@ -318,7 +318,7 @@ class CodexAppServerClient:
         try:
             self._proc.stdin.write(payload)
             self._proc.stdin.flush()
-        except (BrokenPipeError, ValueError) as exc:
+        except (OSError, ValueError) as exc:
             raise CodexAppServerTransportError(
                 f"codex app-server stdin closed unexpectedly: {exc}"
             ) from exc

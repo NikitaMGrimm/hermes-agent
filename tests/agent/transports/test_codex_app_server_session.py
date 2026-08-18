@@ -7,6 +7,7 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import threading
 import time
 from unittest.mock import patch
 from typing import Any, Optional
@@ -456,11 +457,85 @@ class TestRunTurn:
             session._active_turn_id = "turn-live-123"
 
         def fail_write(method, params):
-            raise CodexAppServerTransportError("stdin closed")
+            if method == "turn/steer":
+                raise CodexAppServerTransportError("stdin closed")
+            if method == "turn/start":
+                return {"turn": {"id": "turn-fake-001"}}
+            return {}
 
         client._request_handler = fail_write
 
         assert session.request_steer("Use Postgres instead") is False
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+
+        result = session.run_turn("finish", turn_timeout=2.0)
+
+        assert result.should_retire is True
+
+    def test_inflight_steer_failure_precedes_turn_finalization(self):
+        from agent.transports.codex_app_server import CodexAppServerTransportError
+
+        client = FakeClient()
+        session = make_session(client)
+        steer_started = threading.Event()
+        release_steer = threading.Event()
+        turn_result = []
+
+        def handle_request(method, params):
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "turn/start":
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/steer":
+                steer_started.set()
+                assert release_steer.wait(timeout=2.0)
+                raise CodexAppServerTransportError("stdin closed")
+            return {}
+
+        client._request_handler = handle_request
+        run_thread = threading.Thread(
+            target=lambda: turn_result.append(
+                session.run_turn(
+                    "start",
+                    turn_timeout=2.0,
+                    notification_poll_timeout=0.01,
+                )
+            )
+        )
+        run_thread.start()
+        deadline = time.monotonic() + 2.0
+        while session._active_turn_id is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert session._active_turn_id == "turn-fake-001"
+
+        steer_result = []
+        steer_thread = threading.Thread(
+            target=lambda: steer_result.append(session.request_steer("change course"))
+        )
+        steer_thread.start()
+        assert steer_started.wait(timeout=2.0)
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        time.sleep(0.02)
+        assert run_thread.is_alive()
+
+        release_steer.set()
+        steer_thread.join(timeout=2.0)
+        run_thread.join(timeout=2.0)
+
+        assert steer_result == [False]
+        assert len(turn_result) == 1
+        assert turn_result[0].should_retire is True
 
 
 
@@ -514,6 +589,45 @@ class TestCompactThread:
         assert r.final_text == "compacted"
         assert r.token_usage_last["totalTokens"] == 12
         assert r.model_context_window == 200000
+
+    def test_interrupt_transport_failure_retires_compaction_session(self):
+        from agent.transports.codex_app_server import CodexAppServerTransportError
+
+        client = FakeClient()
+        session = make_session(client)
+        client.queue_notification(
+            "turn/started",
+            threadId="thread-fake-001",
+            turn={"id": "compact-turn-1"},
+        )
+        take_notification = client.take_notification
+
+        def take_and_interrupt(timeout=0.0):
+            notification = take_notification(timeout)
+            if notification and notification["method"] == "turn/started":
+                session.request_interrupt()
+            return notification
+
+        client.take_notification = take_and_interrupt
+
+        def fail_interrupt(method, params):
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "thread/compact/start":
+                return {}
+            if method == "turn/interrupt":
+                raise CodexAppServerTransportError("stdin closed")
+            return {}
+
+        client._request_handler = fail_interrupt
+
+        result = session.compact_thread(turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert result.should_retire is True
 
     def test_compact_start_transport_failure_returns_retiring_result(self):
         from agent.transports.codex_app_server import CodexAppServerTransportError
@@ -942,19 +1056,31 @@ class TestSessionRetirement:
         # Stderr-derived auth hint takes precedence over generic message
         assert r.error and "codex login" in r.error
 
-    def test_interrupt_transport_failure_is_non_fatal(self):
+    def test_interrupt_transport_failure_retires_session(self):
         from agent.transports.codex_app_server import CodexAppServerTransportError
 
         client = FakeClient()
         session = make_session(client)
-        session.ensure_started()
 
         def fail_write(method, params):
-            raise CodexAppServerTransportError("stdin closed")
+            if method == "turn/interrupt":
+                raise CodexAppServerTransportError("stdin closed")
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "turn/start":
+                session.request_interrupt()
+                return {"turn": {"id": "turn-fake-001"}}
+            return {}
 
         client._request_handler = fail_write
 
-        session._issue_interrupt("turn-fake-001")
+        result = session.run_turn("hi", turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert result.should_retire is True
 
 
 # ---- thread/start cross-fill ----
@@ -1028,4 +1154,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

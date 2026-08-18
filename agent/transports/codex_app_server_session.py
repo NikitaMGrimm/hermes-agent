@@ -305,6 +305,7 @@ class CodexAppServerSession:
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
         self._interrupt_event = threading.Event()
+        self._transport_failed = threading.Event()
         self._active_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
         # Pending file-change items, keyed by item id. Populated on
@@ -417,27 +418,29 @@ class CodexAppServerSession:
             turn_id = self._active_turn_id
             thread_id = self._thread_id
             client = self._client
-        if not turn_id or not thread_id or client is None:
-            return False
-        try:
-            response = client.request(
-                "turn/steer",
-                {
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": cleaned}],
-                    "expectedTurnId": turn_id,
-                },
-                timeout=10,
+            if not turn_id or not thread_id or client is None:
+                return False
+            try:
+                response = client.request(
+                    "turn/steer",
+                    {
+                        "threadId": thread_id,
+                        "input": [{"type": "text", "text": cleaned}],
+                        "expectedTurnId": turn_id,
+                    },
+                    timeout=10,
+                )
+            except CodexAppServerTransportError:
+                self._transport_failed.set()
+                logger.debug("turn/steer transport unavailable", exc_info=True)
+                return False
+            except (CodexAppServerError, TimeoutError):
+                logger.debug("turn/steer rejected for active Codex turn", exc_info=True)
+                return False
+            accepted_turn_id = (
+                response.get("turnId") if isinstance(response, dict) else None
             )
-        except (
-            CodexAppServerError,
-            CodexAppServerTransportError,
-            TimeoutError,
-        ):
-            logger.debug("turn/steer rejected for active Codex turn", exc_info=True)
-            return False
-        accepted_turn_id = response.get("turnId") if isinstance(response, dict) else None
-        return accepted_turn_id in {None, turn_id}
+            return accepted_turn_id in {None, turn_id}
 
     # ---------- diagnostics ----------
 
@@ -817,6 +820,7 @@ class CodexAppServerSession:
         with self._active_turn_lock:
             self._active_turn_id = None
         self._interrupt_event.clear()
+        result.should_retire = result.should_retire or self._transport_failed.is_set()
         return result
 
     def compact_thread(
@@ -1024,6 +1028,7 @@ class CodexAppServerSession:
                 )
             result.should_retire = True
 
+        result.should_retire = result.should_retire or self._transport_failed.is_set()
         return result
 
     # ---------- internals ----------
@@ -1043,6 +1048,7 @@ class CodexAppServerSession:
         except TimeoutError:
             logger.warning("turn/interrupt timed out")
         except CodexAppServerTransportError:
+            self._transport_failed.set()
             logger.debug("turn/interrupt transport unavailable", exc_info=True)
 
     def _handle_server_request(self, req: dict) -> None:
