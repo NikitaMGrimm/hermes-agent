@@ -149,6 +149,23 @@ class TestCodexAppServerModule:
         assert isinstance(exc.value, RuntimeError)
         assert client._pending == {}
 
+    def test_payload_serialization_value_error_is_not_transport_failure(self) -> None:
+        from agent.transports.codex_app_server import (
+            CodexAppServerClient,
+            CodexAppServerTransportError,
+        )
+
+        client = object.__new__(CodexAppServerClient)
+        client._closed = False
+        client._proc = type("Proc", (), {"stdin": object()})()
+        circular: dict = {}
+        circular["self"] = circular
+
+        with pytest.raises(ValueError, match="Circular reference") as exc:
+            client._send(circular)
+
+        assert not isinstance(exc.value, CodexAppServerTransportError)
+
 
 class TestSpawnEnvIsolation:
     """The codex spawn must NOT rewrite HOME — codex's shell tool spawns

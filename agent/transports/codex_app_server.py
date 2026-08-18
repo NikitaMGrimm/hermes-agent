@@ -314,8 +314,9 @@ class CodexAppServerClient:
             raise CodexAppServerTransportError(
                 "codex app-server stdin not available"
             )
+        payload = (json.dumps(obj) + "\n").encode("utf-8")
         try:
-            self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+            self._proc.stdin.write(payload)
             self._proc.stdin.flush()
         except (BrokenPipeError, ValueError) as exc:
             raise CodexAppServerTransportError(
