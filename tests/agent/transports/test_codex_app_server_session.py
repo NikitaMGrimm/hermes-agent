@@ -195,23 +195,26 @@ class TestLifecycle:
         s.close()
         assert client._closed is True
 
-    def test_consumed_interrupt_does_not_poison_next_turn(self):
+    def test_preexisting_interrupt_is_consumed_at_turn_boundary(self):
         client = FakeClient()
         session = make_session(client)
         session.request_interrupt()
 
-        assert session.consume_interrupt_request() is True
-        assert session.consume_interrupt_request() is False
+        interrupted = session.run_turn("stopped turn", turn_timeout=2.0)
+
+        assert interrupted.interrupted is True
+        assert not any(method == "turn/start" for method, _ in client.requests)
 
         client.queue_notification(
             "turn/completed",
             threadId="thread-fake-001",
             turn={"id": "turn-fake-001", "status": "completed", "error": None},
         )
-        result = session.run_turn("next turn", turn_timeout=2.0)
+        next_turn = session.run_turn("next turn", turn_timeout=2.0)
 
-        assert result.interrupted is False
-        assert any(method == "turn/start" for method, _ in client.requests)
+        assert next_turn.interrupted is False
+        assert next_turn.error is None
+        assert sum(method == "turn/start" for method, _ in client.requests) == 1
 
 
 # ---- turn loop ----
@@ -455,16 +458,21 @@ class TestRunTurn:
     def test_interrupt_racing_turn_start_failure_is_reported(self, start_error):
         client = FakeClient()
         session = make_session(client)
+        turn_start_calls = 0
 
         def fail_after_interrupt(method, params):
+            nonlocal turn_start_calls
             if method == "thread/start":
                 return {
                     "thread": {"id": "thread-fake-001"},
                     "activePermissionProfile": {"id": "workspace-write"},
                 }
             if method == "turn/start":
-                session.request_interrupt()
-                raise start_error
+                turn_start_calls += 1
+                if turn_start_calls == 1:
+                    session.request_interrupt()
+                    raise start_error
+                return {"turn": {"id": "turn-fake-001"}}
             return {}
 
         client._request_handler = fail_after_interrupt
@@ -472,7 +480,17 @@ class TestRunTurn:
         result = session.run_turn("hi", turn_timeout=2.0)
 
         assert result.interrupted is True
-        assert session.consume_interrupt_request() is False
+
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        next_turn = session.run_turn("next turn", turn_timeout=2.0)
+
+        assert next_turn.interrupted is False
+        assert next_turn.error is None
+        assert turn_start_calls == 2
 
     def test_interrupt_racing_startup_failure_is_reported(self):
         client = FakeClient()
