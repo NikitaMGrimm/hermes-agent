@@ -162,6 +162,52 @@ class TestStripExistingManagedBlock:
 
 class TestMigrate:
 
+    def test_preserves_user_default_permissions(self, tmp_path):
+        target = tmp_path / "config.toml"
+        target.write_text(
+            'default_permissions = ":danger-full-access"\n'
+            "\n"
+            "[features]\n"
+            "terminal_resize_reflow = true\n"
+        )
+
+        report = migrate(
+            {},
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+        )
+
+        text = target.read_text()
+        assert text.count("default_permissions") == 1
+        assert report.wrote_permissions_default is None
+
+        import tomllib
+
+        config = tomllib.loads(text)
+        assert config["default_permissions"] == ":danger-full-access"
+
+    def test_default_permissions_text_in_multiline_value_is_not_a_root_key(
+        self, tmp_path
+    ):
+        target = tmp_path / "config.toml"
+        target.write_text(
+            'instructions = """\n'
+            'default_permissions = ":danger-full-access"\n'
+            '"""\n'
+        )
+
+        migrate(
+            {},
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+        )
+
+        import tomllib
+
+        config = tomllib.loads(target.read_text())
+        assert config["default_permissions"] == ":workspace"
 
 
     def test_plugin_discovery_writes_plugin_blocks(self, tmp_path, monkeypatch):

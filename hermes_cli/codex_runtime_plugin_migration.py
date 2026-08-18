@@ -15,8 +15,8 @@ module:
      OpenClaw calls "migrate native codex plugins" — the YouTube-video-
      worthy bit Pash highlighted: Canva, GitHub, Calendar, Gmail
      pre-configured.)
-  3. Writes a [permissions] default profile so users on this runtime
-     don't get an approval prompt on every write attempt.
+  3. Writes a default permission profile when the user has not configured
+     one, so this runtime does not prompt on every write attempt.
 
 What translates (MCP servers):
   Hermes mcp_servers.<n>.command/args/env  → codex stdio transport
@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -401,6 +402,30 @@ def _looks_like_table_header(stripped_line: str) -> bool:
     return "=" not in head[: bracket_idx + 1]
 
 
+def _has_top_level_default_permissions(toml_text: str) -> bool:
+    """Return whether user-owned root content sets ``default_permissions``."""
+    try:
+        return "default_permissions" in tomllib.loads(toml_text)
+    except tomllib.TOMLDecodeError:
+        # Preserve an explicit root key even when unrelated malformed user
+        # content prevents a complete parse; migration should not add a
+        # second copy and make recovery harder.
+        pass
+
+    for line in toml_text.splitlines():
+        stripped = line.lstrip()
+        if _looks_like_table_header(stripped):
+            break
+        key, separator, _value = stripped.partition("=")
+        if separator and key.strip() in {
+            "default_permissions",
+            '"default_permissions"',
+            "'default_permissions'",
+        }:
+            return True
+    return False
+
+
 def _strip_existing_managed_block(toml_text: str) -> str:
     """Remove any prior managed section so re-runs idempotently replace it.
 
@@ -627,8 +652,9 @@ def migrate(
             into [plugins."<name>@<marketplace>"] entries. Set False to
             skip the subprocess spawn (for tests or restricted environments).
         default_permission_profile: when set (default ":workspace"), write
-            top-level `default_permissions = "<name>"` so users on this
-            runtime don't get an approval prompt on every write attempt.
+            top-level `default_permissions = "<name>"` unless the user has
+            already configured that root key, so this runtime doesn't prompt
+            on every write attempt.
             Built-in codex profile names are ":workspace", ":read-only",
             ":danger-no-sandbox" (note the leading ":"). Also accepts a
             user-defined profile name (no leading ":") that the user has
@@ -682,11 +708,6 @@ def migrate(
         for p in plugins:
             report.migrated_plugins.append(f"{p['name']}@{p['marketplace']}")
 
-    # Track whether we wrote a default permission profile so the report
-    # surfaces it to the user.
-    if default_permission_profile:
-        report.wrote_permissions_default = default_permission_profile
-
     # Inject Hermes' own tool surface as an MCP server so the spawned
     # codex subprocess can call back into Hermes for the tools codex
     # doesn't ship with — web_search, browser_*, delegate_task, vision,
@@ -698,14 +719,9 @@ def migrate(
         if "hermes-tools" not in report.migrated:
             report.migrated.append("hermes-tools")
 
-    # Build the new managed block
-    managed_block = render_codex_toml_section(
-        translated, plugins=plugins,
-        default_permission_profile=default_permission_profile,
-    )
-
     # Read existing codex config if any, strip the prior managed block,
-    # append the new one.
+    # and preserve any explicit user-owned permissions default.
+    without_managed: Optional[str] = None
     if target.exists():
         try:
             existing = target.read_text(encoding="utf-8")
@@ -721,6 +737,26 @@ def migrate(
         # those pre-existing tables since plugin/list is the source of truth.
         if plugin_query_succeeded:
             without_managed = _strip_unmanaged_plugin_tables(without_managed)
+
+    managed_default_permission_profile = default_permission_profile
+    if (
+        without_managed is not None
+        and _has_top_level_default_permissions(without_managed)
+    ):
+        managed_default_permission_profile = None
+
+    # Track whether we wrote a default permission profile so the report
+    # surfaces it to the user.
+    if managed_default_permission_profile:
+        report.wrote_permissions_default = managed_default_permission_profile
+
+    managed_block = render_codex_toml_section(
+        translated,
+        plugins=plugins,
+        default_permission_profile=managed_default_permission_profile,
+    )
+
+    if without_managed is not None:
         new_text = _insert_managed_block_at_top_level(without_managed, managed_block)
     else:
         new_text = managed_block
