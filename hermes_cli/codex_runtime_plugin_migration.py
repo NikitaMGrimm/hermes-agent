@@ -402,28 +402,13 @@ def _looks_like_table_header(stripped_line: str) -> bool:
     return "=" not in head[: bracket_idx + 1]
 
 
-def _has_top_level_default_permissions(toml_text: str) -> bool:
-    """Return whether user-owned root content sets ``default_permissions``."""
+def _can_add_default_permissions(toml_text: str) -> bool:
+    """Return whether a managed default can be added without a root conflict."""
     try:
-        return "default_permissions" in tomllib.loads(toml_text)
+        return "default_permissions" not in tomllib.loads(toml_text)
     except tomllib.TOMLDecodeError:
-        # Preserve an explicit root key even when unrelated malformed user
-        # content prevents a complete parse; migration should not add a
-        # second copy and make recovery harder.
-        pass
-
-    for line in toml_text.splitlines():
-        stripped = line.lstrip()
-        if _looks_like_table_header(stripped):
-            break
-        key, separator, _value = stripped.partition("=")
-        if separator and key.strip() in {
-            "default_permissions",
-            '"default_permissions"',
-            "'default_permissions'",
-        }:
-            return True
-    return False
+        # Do not add another root key while the user's config needs repair.
+        return False
 
 
 def _strip_existing_managed_block(toml_text: str) -> str:
@@ -741,7 +726,7 @@ def migrate(
     managed_default_permission_profile = default_permission_profile
     if (
         without_managed is not None
-        and _has_top_level_default_permissions(without_managed)
+        and not _can_add_default_permissions(without_managed)
     ):
         managed_default_permission_profile = None
 

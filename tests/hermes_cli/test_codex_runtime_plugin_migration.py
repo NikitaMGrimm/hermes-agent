@@ -209,6 +209,20 @@ class TestMigrate:
         config = tomllib.loads(target.read_text())
         assert config["default_permissions"] == ":workspace"
 
+    def test_invalid_config_does_not_gain_default_permissions(self, tmp_path):
+        target = tmp_path / "config.toml"
+        target.write_text('instructions = """\nunclosed\n')
+
+        report = migrate(
+            {},
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+        )
+
+        assert "default_permissions" not in target.read_text()
+        assert report.wrote_permissions_default is None
+
 
     def test_plugin_discovery_writes_plugin_blocks(self, tmp_path, monkeypatch):
         """Discovered curated plugins land as [plugins."<name>@<marketplace>"]
