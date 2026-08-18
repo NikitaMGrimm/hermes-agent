@@ -12,12 +12,16 @@ Verifies that:
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
 import run_agent
+import agent.transports.codex_app_server_session as session_mod
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
 
 
@@ -54,16 +58,17 @@ def _make_codex_agent(**kwargs):
     """Construct an AIAgent in codex_app_server mode without contacting any
     real provider. We pass api_mode explicitly so the constructor takes the
     fast path for direct credentials."""
-    return run_agent.AIAgent(
-        api_key="stub",
-        base_url="https://stub.invalid",
-        provider="openai",
-        api_mode="codex_app_server",
-        quiet_mode=True,
-        skip_context_files=True,
-        skip_memory=True,
-        **kwargs,
-    )
+    options = {
+        "api_key": "stub",
+        "base_url": "https://stub.invalid",
+        "provider": "openai",
+        "api_mode": "codex_app_server",
+        "quiet_mode": True,
+        "skip_context_files": True,
+        "skip_memory": True,
+    }
+    options.update(kwargs)
+    return run_agent.AIAgent(**options)
 
 
 class TestApiModeAccepted:
@@ -85,6 +90,94 @@ class TestRunConversationCodexPath:
         assert result["api_calls"] == 1
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
+
+    @pytest.mark.parametrize("effective_provider", ["custom", "custom:codex-lb"])
+    def test_config_to_thread_start_preserves_named_custom_provider(
+        self, monkeypatch, effective_provider
+    ):
+        home = Path(os.environ["HERMES_HOME"])
+        config = {
+            "model": {
+                "provider": "custom:Corporate Codex",
+                "default": "gpt-5.4",
+                "openai_runtime": "codex_app_server",
+            },
+            "providers": {
+                "Codex LB": {
+                    "name": "Corporate Codex",
+                    "api": "https://gateway.example.com/v1",
+                    "api_key": "hermes-only-test-key",
+                    "default_model": "gpt-5.4",
+                    "transport": "codex_responses",
+                }
+            },
+        }
+        (home / "config.yaml").write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+        )
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider()
+        assert runtime["api_mode"] == "codex_app_server"
+
+        requests = []
+
+        class RecordingClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            def initialize(self, **_kwargs):
+                return {}
+
+            def request(self, method, params=None, timeout=30.0):
+                requests.append((method, params or {}))
+                if method == "thread/start":
+                    return {"thread": {"id": "thread-config-chain"}}
+                return {}
+
+            def close(self):
+                pass
+
+        real_session = CodexAppServerSession
+
+        def session_factory(**kwargs):
+            return real_session(client_factory=RecordingClient, **kwargs)
+
+        monkeypatch.setattr(session_mod, "CodexAppServerSession", session_factory)
+
+        def run_turn(self, user_input, **kwargs):
+            self.ensure_started()
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-config-chain",
+                thread_id="thread-config-chain",
+            )
+
+        monkeypatch.setattr(real_session, "run_turn", run_turn)
+        agent = run_agent.AIAgent(
+            api_key=runtime["api_key"],
+            base_url=runtime["base_url"],
+            provider=runtime["provider"],
+            requested_provider=runtime["requested_provider"],
+            model=config["model"]["default"],
+            api_mode=runtime["api_mode"],
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.provider = effective_provider
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "ok"
+        _, params = next(call for call in requests if call[0] == "thread/start")
+        assert params["cwd"]
+        assert params["model"] == "gpt-5.4"
+        assert params["modelProvider"] == "codex-lb"
+        assert set(params) == {"cwd", "model", "modelProvider"}
 
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
@@ -135,6 +228,64 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.last_completion_tokens == 25
         assert agent.context_compressor.last_total_tokens == 130
         assert agent.context_compressor.context_length == 200000
+
+    def test_model_switch_retires_app_server_session(self, monkeypatch):
+        home = Path(os.environ["HERMES_HOME"])
+        config = {
+            "model": {
+                "provider": "custom:codex-lb",
+                "default": "gpt-5.4",
+                "openai_runtime": "codex_app_server",
+            },
+            "providers": {
+                "codex-lb": {
+                    "api": "https://gateway.example.com/v1",
+                    "api_key": "test-key",
+                    "default_model": "gpt-5.4",
+                    "transport": "codex_responses",
+                }
+            },
+        }
+        (home / "config.yaml").write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+        )
+
+        sessions = []
+
+        class RecordingSession:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.closed = False
+                sessions.append(self)
+
+            def run_turn(self, user_input, **_kwargs):
+                return TurnResult(
+                    final_text=user_input,
+                    projected_messages=[{"role": "assistant", "content": user_input}],
+                    turn_id=f"turn-{len(sessions)}",
+                    thread_id=f"thread-{len(sessions)}",
+                )
+
+            def close(self):
+                self.closed = True
+
+        monkeypatch.setattr(session_mod, "CodexAppServerSession", RecordingSession)
+
+        agent = _make_codex_agent(
+            provider="custom",
+            requested_provider="custom:codex-lb",
+            model="gpt-5.4",
+        )
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("first")
+            agent.model = "gpt-5.5"
+            agent.run_conversation("second")
+
+        assert len(sessions) == 2
+        assert sessions[0].closed is True
+        assert sessions[0].kwargs["model"] == "gpt-5.4"
+        assert sessions[1].kwargs["model"] == "gpt-5.5"
+        assert sessions[1].kwargs["model_provider"] == "codex-lb"
 
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):

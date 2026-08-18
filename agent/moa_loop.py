@@ -367,7 +367,11 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        rt = resolve_runtime_provider(requested=provider, target_model=model)
+        rt = resolve_runtime_provider(
+            requested=provider,
+            target_model=model,
+            allow_codex_app_server=False,
+        )
         if rt.get("base_url"):
             out["base_url"] = rt["base_url"]
         if rt.get("api_key"):

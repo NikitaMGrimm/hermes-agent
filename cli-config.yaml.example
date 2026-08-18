@@ -73,6 +73,18 @@ model:
   # api_key: "your-key-here"  # Uncomment to set here instead of .env
   base_url: "https://openrouter.ai/api/v1"
 
+  # Optional: hand eligible main turns to a Codex app-server subprocess.
+  # Use `/codex-runtime codex_app_server` so Hermes also migrates its
+  # MCP/plugin configuration. `auto` keeps Hermes' normal runtime.
+  # openai_runtime: "auto"
+  #
+  # Named custom providers are eligible when the same normalized provider ID
+  # exists in ~/.codex/config.toml. For `provider: custom:codex-lb`, define
+  # `[model_providers.codex-lb]` there. Codex reads its own base URL and auth;
+  # Hermes sends only the active model and provider ID to `thread/start`.
+  # Bare `provider: custom` is not eligible. Auxiliary calls continue through
+  # the Hermes transport configured for the named provider.
+
   # Azure Foundry keyless auth example:
   # provider: "azure-foundry"
   # base_url: "https://<resource>.openai.azure.com/openai/v1"

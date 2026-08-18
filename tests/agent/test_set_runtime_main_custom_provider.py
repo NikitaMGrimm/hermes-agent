@@ -21,6 +21,71 @@ def _get_globals(mod):
 class TestSetRuntimeMainCustomProvider:
     """set_runtime_main must propagate base_url/api_key/api_mode for custom providers."""
 
+    def test_builtin_app_server_downgrade_does_not_reresolve_runtime(
+        self, monkeypatch
+    ):
+        import agent.auxiliary_client as mod
+        import hermes_cli.runtime_provider as rp
+
+        calls = []
+        monkeypatch.setattr(
+            rp,
+            "resolve_runtime_provider",
+            lambda **kwargs: calls.append(kwargs) or {},
+        )
+
+        mod.clear_runtime_main()
+        try:
+            mod.set_runtime_main(
+                "openai-codex",
+                "gpt-5.4",
+                requested_provider="openai-codex",
+                api_mode="codex_app_server",
+            )
+            assert mod._normalize_main_runtime(None)["api_mode"] == "codex_responses"
+            assert calls == []
+        finally:
+            mod.clear_runtime_main()
+
+    def test_app_server_main_exposes_configured_hermes_transport_to_auxiliary(
+        self, tmp_path, monkeypatch
+    ):
+        import agent.auxiliary_client as mod
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "model:\n"
+            "  default: gpt-5.4\n"
+            "  provider: 'custom:codex-lb'\n"
+            "  openai_runtime: codex_app_server\n"
+            "providers:\n"
+            "  codex-lb:\n"
+            "    api: 'https://gateway.example.com/v1'\n"
+            "    api_key: test-key\n"
+            "    default_model: gpt-5.4\n"
+            "    transport: codex_responses\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mod.clear_runtime_main()
+        try:
+            mod.set_runtime_main(
+                "custom",
+                "gpt-5.4",
+                requested_provider="custom:codex-lb",
+                base_url="https://gateway.example.com/v1",
+                api_key="test-key",
+                api_mode="codex_app_server",
+            )
+
+            runtime = mod._normalize_main_runtime(None)
+            assert runtime["api_mode"] == "codex_responses"
+            assert runtime["requested_provider"] == "custom:codex-lb"
+        finally:
+            mod.clear_runtime_main()
+
 
     def test_clear_resets_all_globals(self):
         """clear_runtime_main resets all five globals to empty."""

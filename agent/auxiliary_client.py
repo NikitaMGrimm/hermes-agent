@@ -3404,6 +3404,35 @@ def set_runtime_main(
     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
     global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
     global _RUNTIME_MAIN_AUTH_MODE, _RUNTIME_MAIN_COMPAT_SNAPSHOT
+    auxiliary_api_mode = (api_mode or "").strip()
+    if auxiliary_api_mode == "codex_app_server":
+        auxiliary_api_mode = "codex_responses"
+        runtime_identity = requested_provider or provider
+        try:
+            from hermes_cli.runtime_provider import (
+                has_named_custom_provider,
+                resolve_runtime_provider,
+            )
+
+            if has_named_custom_provider(runtime_identity):
+                hermes_runtime = resolve_runtime_provider(
+                    requested=runtime_identity,
+                    target_model=model or None,
+                    explicit_api_key=(
+                        api_key if isinstance(api_key, str) else None
+                    ),
+                    explicit_base_url=base_url or None,
+                    allow_codex_app_server=False,
+                )
+                auxiliary_api_mode = (
+                    str(hermes_runtime.get("api_mode") or "").strip()
+                    or auxiliary_api_mode
+                )
+        except Exception:
+            logger.debug(
+                "Auxiliary runtime could not recover the main Hermes transport",
+                exc_info=True,
+            )
     runtime = {
         "provider": (provider or "").strip().lower(),
         "requested_provider": (requested_provider or "").strip().lower(),
@@ -3414,7 +3443,7 @@ def set_runtime_main(
             if isinstance(api_key, str)
             else api_key if callable(api_key) else ""
         ),
-        "api_mode": (api_mode or "").strip(),
+        "api_mode": auxiliary_api_mode,
         "auth_mode": (auth_mode or "").strip().lower(),
         "session_id": (session_id or "").strip(),
         "cache_scope": (cache_scope or "").strip(),
@@ -3486,7 +3515,9 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        runtime = resolve_runtime_provider(requested="custom")
+        runtime = resolve_runtime_provider(
+            requested="custom", allow_codex_app_server=False
+        )
     except Exception as exc:
         logger.debug("Auxiliary client: custom runtime resolution failed: %s", exc)
         runtime = None
@@ -4942,6 +4973,7 @@ def _complete_fallback_destination(
                     requested=provider,
                     explicit_base_url=base_url or None,
                     target_model=model or "",
+                    allow_codex_app_server=False,
                 )
                 api_mode = str(runtime.get("api_mode") or "").strip() or None
             except Exception:

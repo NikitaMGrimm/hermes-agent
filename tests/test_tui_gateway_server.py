@@ -4308,6 +4308,22 @@ def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
     assert kwargs["fallback_model"] == chain
 
 
+def test_background_agent_kwargs_preserves_requested_provider(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="gpt-5.4",
+        provider="custom",
+        requested_provider="custom:codex-lb",
+        _fallback_chain=[],
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a, **_kw: ["file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    kwargs = server._background_agent_kwargs(agent, "task-id")
+
+    assert kwargs["requested_provider"] == "custom:codex-lb"
+
+
 def test_background_agent_kwargs_preserves_empty_fallback_chain(monkeypatch):
     agent = types.SimpleNamespace(
         model="gpt-5.5",

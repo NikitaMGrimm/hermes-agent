@@ -138,5 +138,39 @@ class TestWikiReverseLookup(unittest.TestCase):
         self.assertEqual(query_dict["obj_type"], "docx")
 
 
+def test_comment_agent_preserves_requested_provider():
+    from plugins.platforms.feishu import feishu_comment as mod
+
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "ok", "messages": []}
+
+    runtime = {
+        "provider": "custom",
+        "requested_provider": "custom:codex-lb",
+        "api_mode": "codex_app_server",
+        "base_url": "https://gateway.example/v1",
+        "api_key": "test-key",
+    }
+    with (
+        patch.object(
+            mod,
+            "_resolve_model_and_runtime",
+            return_value=("gpt-5.4", runtime),
+        ),
+        patch("run_agent.AIAgent", FakeAgent),
+        patch("tools.feishu_doc_tool.set_client"),
+        patch("tools.feishu_drive_tool.set_client"),
+    ):
+        assert mod._run_comment_agent("hello", Mock()) == "ok"
+
+    assert captured["requested_provider"] == "custom:codex-lb"
+
+
 if __name__ == "__main__":
     unittest.main()

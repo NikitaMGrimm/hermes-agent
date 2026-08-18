@@ -5,7 +5,7 @@ sidebar_label: Codex App-Server Runtime
 
 # Codex App-Server Runtime
 
-Hermes can optionally hand `openai/*` and `openai-codex/*` turns to the [Codex CLI app-server](https://github.com/openai/codex) instead of running its own tool loop. When enabled, terminal commands, file edits, sandboxing, and MCP tool calls all execute inside Codex's runtime — Hermes becomes the shell around it (sessions DB, slash commands, gateway, memory and skill review).
+Hermes can optionally hand `openai/*`, `openai-codex/*`, and explicitly configured named custom-provider turns to the [Codex CLI app-server](https://github.com/openai/codex) instead of running its own tool loop. When enabled, terminal commands, file edits, sandboxing, and MCP tool calls all execute inside Codex's runtime — Hermes becomes the shell around it (sessions DB, slash commands, gateway, memory and skill review).
 
 This is **opt-in only**. Default Hermes behavior is unchanged unless you flip the flag. Hermes never auto-routes you onto this runtime.
 
@@ -130,7 +130,8 @@ The kanban tools are gated by `HERMES_KANBAN_TASK` env var the dispatcher sets �
 | Kanban worker dispatch | yes | yes (via callback) |
 | Kanban orchestrator tools | yes | yes (via callback) |
 | All gateway platforms | yes | yes |
-| Non-OpenAI providers | yes | n/a — OpenAI/Codex-scoped |
+| Named custom OpenAI-compatible providers | yes | yes (matching Codex `model_providers` ID required) |
+| Other non-Codex built-in providers | yes | no |
 
 ### Live display
 
@@ -154,11 +155,42 @@ uses:
    npm i -g @openai/codex
    codex --version   # 0.130.0 or newer
    ```
-2. **Codex OAuth login.** The codex subprocess reads `~/.codex/auth.json`. Two ways to populate it:
+2. **Configure one provider/auth path:**
+
+   **ChatGPT/OpenAI OAuth:** The codex subprocess reads `~/.codex/auth.json`. Populate it with:
    ```bash
    codex login                  # writes tokens to ~/.codex/auth.json
    ```
    Hermes' own `hermes auth add openai-codex` writes to `~/.hermes/auth.json` — that's a separate session. **Run `codex login` separately** if you haven't.
+
+   **Named custom provider:** use the same stable provider ID in Hermes and Codex. For example, configure Hermes in `~/.hermes/config.yaml`:
+
+   ```yaml
+   providers:
+     codex-lb:
+       api: https://gateway.example.com/v1
+       key_env: CODEX_LB_API_KEY
+       default_model: gpt-5.4
+       transport: codex_responses
+
+   model:
+     default: gpt-5.4
+     provider: custom:codex-lb
+     openai_runtime: codex_app_server
+   ```
+
+   Then configure Codex in `~/.codex/config.toml` with the matching ID:
+
+   ```toml
+   [model_providers.codex-lb]
+   name = "Codex LB"
+   base_url = "https://gateway.example.com/v1"
+   env_key = "CODEX_LB_API_KEY"
+   ```
+
+   Make `CODEX_LB_API_KEY` available to the Hermes/Codex process environment. Hermes sends only the active `model` and `modelProvider = "codex-lb"` on `thread/start`; Codex resolves `base_url` and `env_key` from its own configuration. Hermes does not copy the credential into subprocess arguments or JSON-RPC. Auxiliary and background-review calls still use Hermes' `providers.codex-lb` transport.
+
+   Anonymous `provider: custom` is not eligible because it has no stable ID to pass to Codex.
 
 3. **(Optional) Install the Codex plugins you want.** When you enable the runtime, Hermes auto-migrates whichever curated plugins you've already installed via Codex CLI:
    ```bash
@@ -216,7 +248,7 @@ How the wiring stays equivalent:
 | Skill trigger (`_iters_since_skill >= _skill_nudge_interval`) | computed after the loop | computed after the codex turn |
 | `_spawn_background_review(messages_snapshot=..., review_memory=..., review_skills=...)` | called when either trigger fires | called identically when either trigger fires |
 
-One detail: the review fork itself needs to call Hermes' agent-loop tools (`memory`, `skill_manage`), which require Hermes' own dispatch. So when the parent agent is on `codex_app_server`, the review fork is **downgraded to `codex_responses`** — same OAuth credentials, same `openai-codex` provider, but talks to OpenAI's Responses API directly so Hermes owns the loop and the agent-loop tools work. This is invisible to the user.
+One detail: the review fork itself needs to call Hermes' agent-loop tools (`memory`, `skill_manage`), which require Hermes' own dispatch. So when the parent agent is on `codex_app_server`, the review fork returns to that provider's configured Hermes transport (`codex_responses` for `openai-codex` and for the example `codex-lb`) so Hermes owns the loop and the agent-loop tools work. This is invisible to the user.
 
 Net effect: enable the codex runtime and your memory + skill nudges keep firing exactly as they would otherwise.
 

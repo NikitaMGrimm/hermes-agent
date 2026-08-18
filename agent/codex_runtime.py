@@ -695,9 +695,38 @@ def run_codex_app_server_turn(
         _ServerRequestRouting,
     )
 
-    # Lazy session: one CodexAppServerSession per AIAgent instance.
-    # Spawned on first turn, reused across turns, closed at AIAgent
-    # shutdown (see _cleanup hook).
+    codex_model_provider = None
+    from hermes_cli.runtime_provider import (
+        has_named_custom_provider,
+        normalize_custom_provider_id,
+    )
+
+    provider_candidates = (
+        str(getattr(agent, "requested_provider", "") or ""),
+        str(getattr(agent, "provider", "") or ""),
+    )
+    for candidate in provider_candidates:
+        if not has_named_custom_provider(candidate):
+            continue
+        normalized = normalize_custom_provider_id(candidate)
+        if normalized and normalized != "custom":
+            codex_model_provider = normalized
+            break
+
+    codex_model = getattr(agent, "model", None) if codex_model_provider else None
+    runtime_key = (codex_model, codex_model_provider)
+    session = getattr(agent, "_codex_session", None)
+    if session is not None and getattr(
+        agent, "_codex_session_runtime_key", None
+    ) != runtime_key:
+        try:
+            session.close()
+        finally:
+            agent._codex_session = None
+
+    # Lazy session: one CodexAppServerSession per effective model/provider.
+    # Spawned on first turn, reused across turns, closed at AIAgent shutdown
+    # or when a live model switch changes the app-server routing identity.
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
         from agent.runtime_cwd import resolve_agent_cwd
 
@@ -732,6 +761,7 @@ def run_codex_app_server_turn(
                 exc_info=True,
             )
 
+
         # Bridge codex JSON-RPC notifications (item/started, item/completed,
         # item/agentMessage/delta, ...) into Hermes' gateway UI callbacks
         # (tool_progress_callback, _fire_stream_delta,
@@ -741,6 +771,8 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            model=codex_model,
+            model_provider=codex_model_provider,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -748,6 +780,7 @@ def run_codex_app_server_turn(
             ),
             on_event=make_codex_app_server_event_bridge(agent),
         )
+        agent._codex_session_runtime_key = runtime_key
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early

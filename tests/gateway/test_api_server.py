@@ -35,6 +35,8 @@ from gateway.platforms.api_server import (
     _hermes_version,
     _redact_api_error_text,
     _request_agent_overrides,
+    _resolve_request_runtime_agent_kwargs,
+    _apply_runtime_agent_overrides,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -51,6 +53,30 @@ class TestCheckRequirements:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self):
         assert check_api_server_requirements() is False
+
+
+def test_request_runtime_preserves_named_custom_provider_identity(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "custom",
+            "requested_provider": "custom:codex-lb",
+            "api_mode": "codex_app_server",
+            "base_url": "https://gateway.example/v1",
+            "api_key": "test-key",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider._get_model_config", lambda: {}
+    )
+
+    resolved = _resolve_request_runtime_agent_kwargs(
+        "custom:codex-lb", target_model="gpt-5.4"
+    )
+    merged = _apply_runtime_agent_overrides({}, resolved)
+
+    assert resolved["requested_provider"] == "custom:codex-lb"
+    assert merged["requested_provider"] == "custom:codex-lb"
 
 
 # ---------------------------------------------------------------------------

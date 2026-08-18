@@ -656,6 +656,32 @@ def test_named_custom_provider_uses_saved_credentials(monkeypatch):
     assert resolved["source"] == "custom_provider:Local"
 
 
+@pytest.mark.parametrize("requested", ["custom:codex-lb", "codex-lb"])
+def test_named_custom_provider_can_opt_into_codex_app_server(monkeypatch, requested):
+    config = {
+        "model": {
+            "provider": "custom:codex-lb",
+            "default": "gpt-5.4",
+            "openai_runtime": "codex_app_server",
+        },
+        "providers": {
+            "codex-lb": {
+                "api": "https://gateway.example.com/v1",
+                "api_key": "test-key",
+                "default_model": "gpt-5.4",
+                "transport": "codex_responses",
+            }
+        },
+    }
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+
+    resolved = rp.resolve_runtime_provider(requested=requested)
+
+    assert resolved["provider"] == "custom"
+    assert resolved["requested_provider"] == requested
+    assert resolved["api_mode"] == "codex_app_server"
+
+
 def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
     """A request for bare ``provider="custom"`` must resolve a literal
     ``providers.custom`` entry (e.g. a cliproxy endpoint) instead of falling
@@ -668,6 +694,7 @@ def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
         rp,
         "load_config",
         lambda: {
+            "model": {"openai_runtime": "codex_app_server"},
             "providers": {
                 "custom": {
                     "api": "https://cliproxy.example.com/v1",
@@ -696,6 +723,7 @@ def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
     assert resolved["base_url"] == "https://cliproxy.example.com/v1"
     assert resolved["api_key"] == "cliproxy-key"
     assert resolved["requested_provider"] == "custom"
+    assert resolved["api_mode"] != "codex_app_server"
 
 
 
