@@ -149,8 +149,9 @@ that upstream still lacks.
   [#83129](https://github.com/NousResearch/hermes-agent/pull/83129), plus fork
   hardening commits `f622c0aa34f5eef63f74f13294bfa25ab2581ec2` and
   `5428602b52bb79fe1339caf7224b9d9bd1767eef`, plus lifecycle hardening commit
-  `83234966b7b398a418fd11d17bba58c88ccd68bc` and long-turn deadline commit
-  `f61e74d4d84863c22800f7a28b4fff25b25fa6e4`.
+  `83234966b7b398a418fd11d17bba58c88ccd68bc`, long-turn deadline commit
+  `f61e74d4d84863c22800f7a28b4fff25b25fa6e4`, and legacy interrupt cleanup
+  compatibility commit `5c13df6933b39d32c855465522f0afd0296347d5`.
 - **Ownership:** temporarily carried until upstream provides the complete
   behavior. The fork hardening closes serialization, generic pipe-I/O,
   interrupt, compaction, and in-flight steer/finalization gaps discovered
