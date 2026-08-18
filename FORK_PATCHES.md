@@ -138,3 +138,31 @@ that upstream still lacks.
   `tests/gateway/test_feishu_comment.py`. Inspect the recorded `thread/start`
   payload to ensure it contains no Hermes base URL or credential, and exercise
   one real TUI/desktop or gateway session plus one auxiliary review path.
+
+### Codex App Server write-failure retirement
+
+- **Status:** upstream-open with fork hardening.
+- **Provenance:** local commits
+  `f2340caad0bc6a5d1c80a67a9dc665f9ea3cee04` and
+  `64dc034cd195e456eccd15ea99bf7bc2f8c99499`, preserving fangliquanflq's
+  authorship from upstream open PR
+  [#83129](https://github.com/NousResearch/hermes-agent/pull/83129), plus fork
+  hardening commits `f622c0aa34f5eef63f74f13294bfa25ab2581ec2` and
+  `5428602b52bb79fe1339caf7224b9d9bd1767eef`.
+- **Ownership:** temporarily carried until upstream provides the complete
+  behavior. The fork hardening closes serialization, generic pipe-I/O,
+  interrupt, compaction, and in-flight steer/finalization gaps discovered
+  during independent review of the upstream patch.
+- **Contract:** JSON serialization failures remain ordinary request errors and
+  clean their pending RPC state without killing a healthy transport. Every
+  actual App Server write failure is typed as a transport failure, clears the
+  pending request, and makes the affected runtime or session non-reusable.
+  Response, steer, interrupt, compaction, and finalization paths propagate the
+  retirement decision so the next turn starts a fresh App Server process.
+- **Removal:** pure upstream must pass
+  `tests/agent/transports/test_codex_app_server_runtime.py` and
+  `tests/agent/transports/test_codex_app_server_session.py`, including circular
+  serialization, `BrokenPipeError` and generic `OSError` writes, pending-state
+  cleanup, response write failure, steer/finalization races, interrupt failure,
+  and compaction failure. Also reproduce the original gateway symptom and
+  verify that the failed session is retired before the following turn.
