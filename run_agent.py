@@ -3226,24 +3226,11 @@ class AIAgent:
                     )
             event.set()
 
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is not None:
-            with _redirect_lock:
-                self._interrupt_requested = True
-                self._interrupt_message = message
-                if hard_cancel:
-                    _admit_hard_cancel()
-                self._pending_redirect = None
-        else:
-            self._interrupt_requested = True
-            self._interrupt_message = message
-            if hard_cancel:
-                _admit_hard_cancel()
-            self._pending_redirect = None
-
-        # Codex app-server owns its model/tool loop and watches a private
-        # interrupt event rather than Hermes' per-thread flag.
-        if getattr(self, "api_mode", None) == "codex_app_server":
+        def _signal_codex_interrupt() -> None:
+            # Keep the agent flag and session wakeup event in one critical
+            # section. Atomic claiming uses the same admission lock.
+            if getattr(self, "api_mode", None) != "codex_app_server":
+                return
             _codex_session = getattr(self, "_codex_session", None)
             _request_interrupt = getattr(_codex_session, "request_interrupt", None)
             if callable(_request_interrupt):
@@ -3254,6 +3241,23 @@ class AIAgent:
                         "Failed to interrupt Codex app-server turn",
                         exc_info=True,
                     )
+
+        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
+        if _redirect_lock is not None:
+            with _redirect_lock:
+                self._interrupt_requested = True
+                self._interrupt_message = message
+                if hard_cancel:
+                    _admit_hard_cancel()
+                self._pending_redirect = None
+                _signal_codex_interrupt()
+        else:
+            self._interrupt_requested = True
+            self._interrupt_message = message
+            if hard_cancel:
+                _admit_hard_cancel()
+            self._pending_redirect = None
+            _signal_codex_interrupt()
 
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
@@ -3321,31 +3325,26 @@ class AIAgent:
         # newer keyword-only hard_cancel argument.
         AIAgent.interrupt(self, message, hard_cancel=True)
 
-    def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
-        """Clear the interrupt request and per-thread tool signal.
+    def _clear_interrupt_locked(self, *, preserve_redirect: bool = False) -> bool:
+        """Clear interrupt state while the redirect admission lock is held."""
+        if preserve_redirect and not getattr(self, "_pending_redirect", None):
+            return False
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            _codex_session = getattr(self, "_codex_session", None)
+            _consume_interrupt = getattr(
+                _codex_session, "consume_interrupt_request", None
+            )
+            if callable(_consume_interrupt):
+                _consume_interrupt()
+        self._interrupt_requested = False
+        self._interrupt_message = None
+        getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
+        if not preserve_redirect:
+            self._pending_redirect = None
+        return True
 
-        ``preserve_redirect`` is used only by the conversation loop after it
-        intentionally cancels a model request to rebuild that same logical
-        turn. Public hard-stop paths keep the default and clear everything.
-        """
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is not None:
-            with _redirect_lock:
-                if preserve_redirect and not self._pending_redirect:
-                    return False
-                self._interrupt_requested = False
-                self._interrupt_message = None
-                getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
-                if not preserve_redirect:
-                    self._pending_redirect = None
-        else:
-            if preserve_redirect and not getattr(self, "_pending_redirect", None):
-                return False
-            self._interrupt_requested = False
-            self._interrupt_message = None
-            getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
-            if not preserve_redirect:
-                self._pending_redirect = None
+    def _finish_interrupt_cleanup(self) -> None:
+        """Clear thread/tool side signals after interrupt ownership is claimed."""
         self._interrupt_thread_signal_pending = False
         if self._execution_thread_id is not None:
             _set_interrupt(False, self._execution_thread_id)
@@ -3374,7 +3373,50 @@ class AIAgent:
         if _steer_lock is not None:
             with _steer_lock:
                 self._pending_steer = None
-        return True
+
+    def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
+        """Clear the interrupt request and per-thread tool signal.
+
+        ``preserve_redirect`` is used only by the conversation loop after it
+        intentionally cancels a model request to rebuild that same logical
+        turn. Public hard-stop paths keep the default and clear everything.
+        """
+        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
+        if _redirect_lock is None:
+            cleared = self._clear_interrupt_locked(
+                preserve_redirect=preserve_redirect
+            )
+            if cleared:
+                self._finish_interrupt_cleanup()
+        else:
+            with _redirect_lock:
+                cleared = self._clear_interrupt_locked(
+                    preserve_redirect=preserve_redirect
+                )
+                if cleared:
+                    self._finish_interrupt_cleanup()
+        return cleared
+
+    def consume_interrupt_state(self) -> tuple[bool, Optional[str]]:
+        """Atomically claim and clear the current logical-turn interrupt.
+
+        The return value identifies the interrupt that was present at the
+        claim boundary. A later interrupt waits for the same admission lock
+        and therefore remains intact for the following logical turn.
+        """
+        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
+        if _redirect_lock is None:
+            requested = bool(getattr(self, "_interrupt_requested", False))
+            message = self._interrupt_message if requested else None
+            self._clear_interrupt_locked()
+            self._finish_interrupt_cleanup()
+        else:
+            with _redirect_lock:
+                requested = bool(self._interrupt_requested)
+                message = self._interrupt_message if requested else None
+                self._clear_interrupt_locked()
+                self._finish_interrupt_cleanup()
+        return requested, message
 
     def steer(self, text: str) -> bool:
         """

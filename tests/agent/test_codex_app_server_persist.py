@@ -26,7 +26,7 @@ duplicate the user turn (#860 / #42039). This test locks in:
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.codex_runtime import run_codex_app_server_turn
 from hermes_state import SessionDB
@@ -51,6 +51,10 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     # Pre-seed the session so run_codex_app_server_turn skips the spawn block.
     agent._codex_session = MagicMock()
     agent._codex_session.run_turn.return_value = _make_turn()
+    agent._codex_session_runtime_key = (None, None)
+    agent.requested_provider = ""
+    agent.provider = ""
+    agent.model = None
     agent.tool_progress_callback = None
     agent._iters_since_skill = 0
     agent._skill_nudge_interval = 0
@@ -58,6 +62,8 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     agent._session_db = session_db
     agent._session_db_created = True
     agent.session_id = session_id
+    agent._interrupt_requested = False
+    agent._interrupt_message = None
     return agent
 
 
@@ -82,9 +88,13 @@ def test_codex_user_interrupt_is_reported_and_cleared():
     turn = _make_turn()
     turn.interrupted = True
     turn.final_text = ""
-    agent._codex_session.run_turn.return_value = turn
-    agent._interrupt_requested = True
-    agent._interrupt_message = "new correction"
+
+    def interrupted_turn(*, user_input):
+        agent._interrupt_requested = True
+        agent._interrupt_message = "new correction"
+        return turn
+
+    agent._codex_session.run_turn.side_effect = interrupted_turn
 
     def clear_interrupt():
         agent._interrupt_requested = False
@@ -103,6 +113,98 @@ def test_codex_user_interrupt_is_reported_and_cleared():
     assert result["interrupt_message"] == "new correction"
     agent.clear_interrupt.assert_called_once_with()
     assert agent._interrupt_requested is False
+
+
+def test_codex_late_interrupt_reconciles_completed_session_result():
+    """A stop racing turn/completed belongs to this turn, never the next one."""
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+
+    def completed_while_interrupting(*, user_input):
+        agent._interrupt_requested = True
+        agent._interrupt_message = "stop at completion"
+        return turn
+
+    agent._codex_session.run_turn.side_effect = completed_while_interrupting
+
+    def clear_interrupt():
+        agent._interrupt_requested = False
+        agent._interrupt_message = None
+
+    agent.clear_interrupt.side_effect = clear_interrupt
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["completed"] is False
+    assert result["partial"] is True
+    assert result["interrupted"] is True
+    assert result["interrupt_message"] == "stop at completion"
+    assert agent._interrupt_requested is False
+
+
+def test_codex_interrupt_preserved_after_compaction_skips_next_turn():
+    """A stop consumed by native compaction must still abort the logical turn."""
+    from agent.conversation_compression import (
+        _compress_context_via_codex_app_server,
+    )
+
+    agent = _make_agent(session_db=None)
+    agent._cached_system_prompt = "system"
+
+    def interrupted_compaction():
+        agent._interrupt_requested = True
+        agent._interrupt_message = "stop during compaction"
+        return SimpleNamespace(interrupted=True, error=None, should_retire=False)
+
+    agent._codex_session.compact_thread.side_effect = interrupted_compaction
+
+    def clear_interrupt():
+        agent._interrupt_requested = False
+        agent._interrupt_message = None
+
+    agent.clear_interrupt.side_effect = clear_interrupt
+    messages = [{"role": "user", "content": "hello"}]
+
+    heartbeat = MagicMock()
+    heartbeat.start.return_value = heartbeat
+    with patch(
+        "agent.conversation_compression._CompressionActivityHeartbeat",
+        return_value=heartbeat,
+    ):
+        compressed, system_prompt = _compress_context_via_codex_app_server(
+            agent,
+            messages,
+            "system",
+            approx_tokens=100_000,
+            force=True,
+        )
+
+    assert compressed is messages
+    assert system_prompt == "system"
+    assert agent._interrupt_requested is True
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=messages,
+        effective_task_id="task-1",
+    )
+
+    agent._codex_session.run_turn.assert_not_called()
+    # Draining is idempotent; the contract is that the private wakeup is
+    # consumed before the logical turn returns, not a particular call count.
+    assert agent._codex_session.consume_interrupt_request.call_count >= 1
+    assert result["completed"] is False
+    assert result["partial"] is True
+    assert result["interrupted"] is True
+    assert result["interrupt_message"] == "stop during compaction"
+    agent.clear_interrupt.assert_called_once_with()
 
 
 def test_codex_turn_persists_each_message_exactly_once():
@@ -129,6 +231,7 @@ def test_codex_turn_persists_each_message_exactly_once():
         agent._session_db_created = True
         agent._codex_session = MagicMock()
         agent._codex_session.run_turn.return_value = _make_turn()
+        setattr(agent, "_codex_session_runtime_key", (None, None))
         agent.tool_progress_callback = None
 
         # Model the real flow: the inbound user turn is flushed at turn start

@@ -20,7 +20,7 @@ import json
 import logging
 import time
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
@@ -692,6 +692,7 @@ def run_codex_app_server_turn(
     """
     from agent.transports.codex_app_server_session import (
         CodexAppServerSession,
+        TurnResult,
         _ServerRequestRouting,
     )
 
@@ -786,56 +787,73 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
-    try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
-    except Exception as exc:
-        logger.exception("codex app-server turn failed")
-        # Crash → unconditionally drop the session so the next turn
-        # respawns from scratch instead of reusing a dead client.
+    def _consume_agent_interrupt() -> tuple[bool, Optional[str]]:
+        """Atomically claim this logical turn's agent-level interrupt."""
+        consume = getattr(type(agent), "consume_interrupt_state", None)
+        if callable(consume):
+            return consume(agent)
+        # Compatibility for lightweight test doubles and third-party agent
+        # implementations that predate the atomic claimant.
+        requested = bool(getattr(agent, "_interrupt_requested", False))
+        message = (
+            getattr(agent, "_interrupt_message", None) if requested else None
+        )
+        codex_session = getattr(agent, "_codex_session", None)
+        consume_session_interrupt = getattr(
+            codex_session, "consume_interrupt_request", None
+        )
+        if callable(consume_session_interrupt):
+            consume_session_interrupt()
+        agent.clear_interrupt()
+        return requested, message
+
+    # Native compaction can consume the session-private interrupt event before
+    # returning to the conversation loop.  The agent-level flag is the durable
+    # logical-turn signal: honor it here before starting the next Codex turn.
+    # An interrupt racing this check is still safe because ``interrupt()`` also
+    # signals the session event polled by ``run_turn()``.
+    if getattr(agent, "_interrupt_requested", False):
+        turn = TurnResult(interrupted=True)
+    else:
         try:
-            agent._codex_session.close()
-        except Exception:
-            pass
-        agent._codex_session = None
-        _user_interrupted = bool(
-            getattr(agent, "_interrupt_requested", False)
-        )
-        _interrupt_message = (
-            getattr(agent, "_interrupt_message", None)
-            if _user_interrupted
-            else None
-        )
-        if _user_interrupted:
-            agent.clear_interrupt()
-        return {
-            "final_response": (
-                f"Codex app-server turn failed: {exc}. "
-                f"Fall back to default runtime with `/codex-runtime auto`."
-            ),
-            "messages": messages,
-            "api_calls": 0,
-            "completed": False,
-            "partial": True,
-            "interrupted": _user_interrupted,
-            **(
-                {"interrupt_message": _interrupt_message}
-                if _interrupt_message
-                else {}
-            ),
-            "error": str(exc),
-        }
+            turn = agent._codex_session.run_turn(user_input=user_message)
+        except Exception as exc:
+            logger.exception("codex app-server turn failed")
+            # Crash → unconditionally drop the session so the next turn
+            # respawns from scratch instead of reusing a dead client.
+            try:
+                agent._codex_session.close()
+            except Exception:
+                pass
+            agent._codex_session = None
+            _user_interrupted, _interrupt_message = _consume_agent_interrupt()
+            return {
+                "final_response": (
+                    f"Codex app-server turn failed: {exc}. "
+                    f"Fall back to default runtime with `/codex-runtime auto`."
+                ),
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "partial": True,
+                "interrupted": _user_interrupted,
+                **(
+                    {"interrupt_message": _interrupt_message}
+                    if _interrupt_message
+                    else {}
+                ),
+                "error": str(exc),
+            }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
     # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a
     # message-bearing compatibility interrupt can still be replayed by callers.
-    _user_interrupted = bool(
-        turn.interrupted and getattr(agent, "_interrupt_requested", False)
-    )
-    _interrupt_message = (
-        getattr(agent, "_interrupt_message", None) if _user_interrupted else None
-    )
-    if _user_interrupted:
-        agent.clear_interrupt()
+    # Reconcile the durable agent-level flag even when the session received a
+    # terminal notification in the same polling iteration as the interrupt.
+    # Otherwise that late stop can be cleared from the private session event,
+    # reported as a successful current turn, and then poison the next turn.
+    _user_interrupted, _interrupt_message = _consume_agent_interrupt()
+    turn.interrupted = turn.interrupted or _user_interrupted
 
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess

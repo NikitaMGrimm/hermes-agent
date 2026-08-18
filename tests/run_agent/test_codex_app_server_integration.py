@@ -844,6 +844,30 @@ class TestSessionRetirementOnRunAgent:
         assert result["completed"] is False
         assert "codex segfaulted" in result["error"]
 
+    def test_exception_path_atomically_claims_interrupt(self, monkeypatch):
+        agent = _make_codex_agent()
+
+        def interrupted_failure(self, user_input, **kwargs):
+            agent.interrupt("stop during transport failure")
+            raise RuntimeError("transport exploded")
+
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "run_turn",
+            interrupted_failure,
+        )
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hi")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["interrupted"] is True
+        assert result["interrupt_message"] == "stop during transport failure"
+        assert "transport exploded" in result["error"]
+        assert agent._interrupt_requested is False
+        assert agent._interrupt_message is None
+        assert agent._codex_session is None
+
 
 class TestCodexToolProgressBridge:
     """#38835 / #33200: Codex app-server item notifications must surface as

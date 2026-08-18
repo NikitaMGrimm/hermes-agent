@@ -7,6 +7,8 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 
 import pytest
@@ -187,6 +189,7 @@ class TestCodexAppServerModule:
         client._next_id = 1
         client._pending = {}
         client._pending_lock = threading.Lock()
+        client._send_lock = threading.Lock()
         client._closed = False
         client._proc = type("Proc", (), {"stdin": BrokenStdin()})()
 
@@ -194,6 +197,123 @@ class TestCodexAppServerModule:
             client.request("turn/start", {})
 
         assert client._pending == {}
+
+    def test_send_completes_short_writes(self) -> None:
+        from agent.transports.codex_app_server import CodexAppServerClient
+
+        class ShortStdin:
+            def __init__(self) -> None:
+                self.data = bytearray()
+                self.flushed = False
+
+            def write(self, payload) -> int:
+                accepted = bytes(payload[:7])
+                self.data.extend(accepted)
+                return len(accepted)
+
+            def flush(self) -> None:
+                self.flushed = True
+
+        stdin = ShortStdin()
+        client = object.__new__(CodexAppServerClient)
+        client._closed = False
+        client._send_lock = threading.Lock()
+        client._proc = type("Proc", (), {"stdin": stdin})()
+
+        client._send({"method": "test", "params": {"value": "x" * 100}})
+
+        assert stdin.flushed is True
+        assert json.loads(bytes(stdin.data)) == {
+            "method": "test",
+            "params": {"value": "x" * 100},
+        }
+
+    def test_send_rejects_zero_length_write(self) -> None:
+        from agent.transports.codex_app_server import (
+            CodexAppServerClient,
+            CodexAppServerTransportError,
+        )
+
+        class StalledStdin:
+            def write(self, _payload) -> int:
+                return 0
+
+            def flush(self) -> None:
+                raise AssertionError("flush should not follow a stalled write")
+
+        client = object.__new__(CodexAppServerClient)
+        client._closed = False
+        client._send_lock = threading.Lock()
+        client._proc = type("Proc", (), {"stdin": StalledStdin()})()
+
+        with pytest.raises(CodexAppServerTransportError, match="accepted no data"):
+            client._send({"method": "test"})
+
+    def test_concurrent_large_frames_remain_distinct_json_lines(self) -> None:
+        from agent.transports.codex_app_server import CodexAppServerClient
+
+        read_fd, write_fd = os.pipe()
+        stdin = os.fdopen(write_fd, "wb", buffering=0)
+        client = object.__new__(CodexAppServerClient)
+        client._closed = False
+        client._send_lock = threading.Lock()
+        client._proc = type("Proc", (), {"stdin": stdin})()
+        barrier = threading.Barrier(3)
+        chunks: list[bytes] = []
+        errors: list[BaseException] = []
+
+        def drain_pipe() -> None:
+            with os.fdopen(read_fd, "rb", buffering=0) as reader:
+                while chunk := reader.read(65536):
+                    chunks.append(chunk)
+
+        def send(marker: str) -> None:
+            try:
+                barrier.wait()
+                client._send({"method": "test", "params": {"body": marker * 500_000}})
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        reader = threading.Thread(target=drain_pipe)
+        senders = [threading.Thread(target=send, args=(marker,)) for marker in ("a", "b")]
+        reader.start()
+        for sender in senders:
+            sender.start()
+        barrier.wait()
+        for sender in senders:
+            sender.join(timeout=5)
+        stdin.close()
+        reader.join(timeout=5)
+
+        assert not errors
+        assert all(not sender.is_alive() for sender in senders)
+        assert not reader.is_alive()
+        frames = [json.loads(line) for line in b"".join(chunks).splitlines()]
+        assert len(frames) == 2
+        assert {frame["params"]["body"][0] for frame in frames} == {"a", "b"}
+        assert all(len(frame["params"]["body"]) == 500_000 for frame in frames)
+
+    def test_concurrent_request_ids_are_unique(self) -> None:
+        from agent.transports.codex_app_server import CodexAppServerClient
+
+        client = object.__new__(CodexAppServerClient)
+        client._next_id = 1
+        client._pending_lock = threading.Lock()
+        ids: list[int] = []
+
+        def allocate_ids() -> None:
+            ids.extend(client._take_id() for _ in range(1_000))
+
+        threads = [threading.Thread(target=allocate_ids) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(ids) == 4_000
+        assert len(set(ids)) == 4_000
+        assert min(ids) == 1
+        assert max(ids) == 4_000
 
 
 class TestSpawnEnvIsolation:

@@ -183,10 +183,51 @@ class TestLifecycle:
         s.close()
         assert client._closed is True
 
+    def test_consumed_interrupt_does_not_poison_next_turn(self):
+        client = FakeClient()
+        session = make_session(client)
+        session.request_interrupt()
+
+        assert session.consume_interrupt_request() is True
+        assert session.consume_interrupt_request() is False
+
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        result = session.run_turn("next turn", turn_timeout=2.0)
+
+        assert result.interrupted is False
+        assert any(method == "turn/start" for method, _ in client.requests)
+
 
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_interrupt_racing_terminal_notification_marks_current_turn(self):
+        client = FakeClient()
+        session = make_session(client)
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        take_notification = client.take_notification
+
+        def take_and_interrupt(timeout=0.0):
+            notification = take_notification(timeout)
+            if notification is not None:
+                session.request_interrupt()
+            return notification
+
+        client.take_notification = take_and_interrupt
+
+        result = session.run_turn("race", turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert session.consume_interrupt_request() is False
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
@@ -391,6 +432,54 @@ class TestRunTurn:
         assert "sk-transport-secret" not in result.error
         assert result.should_retire is True
 
+    @pytest.mark.parametrize(
+        "start_error",
+        [
+            session_mod.CodexAppServerError(code=-32603, message="start failed"),
+            TimeoutError("start timed out"),
+            session_mod.CodexAppServerTransportError("stdin closed"),
+        ],
+    )
+    def test_interrupt_racing_turn_start_failure_is_reported(self, start_error):
+        client = FakeClient()
+        session = make_session(client)
+
+        def fail_after_interrupt(method, params):
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "turn/start":
+                session.request_interrupt()
+                raise start_error
+            return {}
+
+        client._request_handler = fail_after_interrupt
+
+        result = session.run_turn("hi", turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert session.consume_interrupt_request() is False
+
+    def test_interrupt_racing_startup_failure_is_reported(self):
+        client = FakeClient()
+        session = make_session(client)
+
+        def fail_startup(method, params):
+            if method == "thread/start":
+                session.request_interrupt()
+                raise TimeoutError("thread startup timed out")
+            return {}
+
+        client._request_handler = fail_startup
+
+        result = session.run_turn("hi", turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert session.consume_interrupt_request() is False
+
     def test_turn_start_unrelated_runtime_error_still_escapes(self):
         client = FakeClient()
 
@@ -544,6 +633,72 @@ class TestRunTurn:
 
 
 class TestCompactThread:
+    def test_interrupt_racing_compact_startup_failure_is_reported(self):
+        client = FakeClient()
+        session = make_session(client)
+
+        def fail_startup(method, params):
+            if method == "thread/start":
+                session.request_interrupt()
+                raise TimeoutError("thread startup timed out")
+            return {}
+
+        client._request_handler = fail_startup
+
+        result = session.compact_thread(turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert session.consume_interrupt_request() is False
+
+    def test_interrupt_racing_compact_start_failure_is_reported(self):
+        client = FakeClient()
+        session = make_session(client)
+
+        def fail_compact_start(method, params):
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "thread/compact/start":
+                session.request_interrupt()
+                raise session_mod.CodexAppServerError(
+                    code=-32603,
+                    message="compact failed",
+                )
+            return {}
+
+        client._request_handler = fail_compact_start
+
+        result = session.compact_thread(turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert session.consume_interrupt_request() is False
+
+    def test_interrupt_during_startup_prevents_compaction(self):
+        client = FakeClient()
+        session = make_session(client)
+
+        def interrupt_during_startup(method, params):
+            if method == "thread/start":
+                session.request_interrupt()
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            return {}
+
+        client._request_handler = interrupt_during_startup
+
+        result = session.compact_thread(turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert result.should_retire is False
+        assert not any(
+            method == "thread/compact/start" for method, _ in client.requests
+        )
+
     def test_compact_thread_sends_rpc_and_waits_for_completion(self):
         client = FakeClient()
         client.queue_notification(
@@ -628,6 +783,115 @@ class TestCompactThread:
 
         assert result.interrupted is True
         assert result.should_retire is True
+
+    def test_interrupt_before_compact_turn_id_retires_session(self):
+        client = FakeClient()
+        session = make_session(client)
+
+        def interrupt_before_turn_started(method, params):
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "thread/compact/start":
+                session.request_interrupt()
+                return {}
+            return {}
+
+        client._request_handler = interrupt_before_turn_started
+
+        result = session.compact_thread(turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "before its turn id" in result.error
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_successful_compact_interrupt_clears_private_event(self):
+        client = FakeClient()
+        session = make_session(client)
+        client.queue_notification(
+            "turn/started",
+            threadId="thread-fake-001",
+            turn={"id": "compact-turn-1"},
+        )
+        take_notification = client.take_notification
+
+        def take_and_interrupt(timeout=0.0):
+            notification = take_notification(timeout)
+            if notification and notification["method"] == "turn/started":
+                session.request_interrupt()
+            return notification
+
+        setattr(client, "take_notification", take_and_interrupt)
+
+        compact_result = session.compact_thread(turn_timeout=2.0)
+
+        assert compact_result.interrupted is True
+        assert compact_result.should_retire is False
+        assert session._interrupt_event.is_set() is False
+
+    @pytest.mark.parametrize(
+        "interrupt_error",
+        [
+            TimeoutError("interrupt timed out"),
+            pytest.param(
+                session_mod.CodexAppServerError(code=-32603, message="interrupt failed"),
+                id="json-rpc-error",
+            ),
+        ],
+    )
+    def test_unconfirmed_interrupt_retires_session(self, interrupt_error):
+        client = FakeClient()
+        session = make_session(client)
+
+        def fail_interrupt(method, params):
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "turn/start":
+                session.request_interrupt()
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/interrupt":
+                raise interrupt_error
+            return {}
+
+        client._request_handler = fail_interrupt
+
+        result = session.run_turn("hi", turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+
+    def test_no_active_turn_interrupt_keeps_completed_session(self):
+        client = FakeClient()
+        session = make_session(client)
+
+        def completed_before_interrupt(method, params):
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "turn/start":
+                session.request_interrupt()
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/interrupt":
+                raise session_mod.CodexAppServerError(
+                    code=-32603,
+                    message="no active turn to interrupt",
+                )
+            return {}
+
+        client._request_handler = completed_before_interrupt
+
+        result = session.run_turn("hi", turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert result.should_retire is False
 
     def test_compact_start_transport_failure_returns_retiring_result(self):
         from agent.transports.codex_app_server import CodexAppServerTransportError

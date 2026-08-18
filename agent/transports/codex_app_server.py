@@ -147,6 +147,7 @@ class CodexAppServerClient:
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._notifications: queue.Queue = queue.Queue()
         self._server_requests: queue.Queue = queue.Queue()
         self._stderr_lines: list[str] = []
@@ -303,21 +304,35 @@ class CodexAppServerClient:
         # JSON-RPC ids only need to be unique per-connection. A simple
         # monotonically increasing int is the common choice and matches what
         # codex's own clients use.
-        rid = self._next_id
-        self._next_id += 1
-        return rid
+        with self._pending_lock:
+            rid = self._next_id
+            self._next_id += 1
+            return rid
 
     def _send(self, obj: dict) -> None:
-        if self._closed:
-            raise CodexAppServerTransportError("codex app-server client is closed")
-        if self._proc.stdin is None:
-            raise CodexAppServerTransportError(
-                "codex app-server stdin not available"
-            )
         payload = (json.dumps(obj) + "\n").encode("utf-8")
         try:
-            self._proc.stdin.write(payload)
-            self._proc.stdin.flush()
+            with self._send_lock:
+                if self._closed:
+                    raise CodexAppServerTransportError(
+                        "codex app-server client is closed"
+                    )
+                stdin = self._proc.stdin
+                if stdin is None:
+                    raise CodexAppServerTransportError(
+                        "codex app-server stdin not available"
+                    )
+                remaining = memoryview(payload)
+                while remaining:
+                    written = stdin.write(remaining)
+                    if written is None or written <= 0:
+                        raise CodexAppServerTransportError(
+                            "codex app-server stdin accepted no data"
+                        )
+                    remaining = remaining[written:]
+                stdin.flush()
+        except CodexAppServerTransportError:
+            raise
         except (OSError, ValueError) as exc:
             raise CodexAppServerTransportError(
                 f"codex app-server stdin closed unexpectedly: {exc}"

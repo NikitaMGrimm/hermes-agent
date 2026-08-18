@@ -49,7 +49,6 @@ logger = logging.getLogger(__name__)
 # enough to surface a config/provider/auth diagnostic.
 _STDERR_TAIL_LINES = 12
 
-
 # Permission profile mapping mirrors the docstring in PR proposal:
 # Hermes' tools.terminal.security_mode → Codex's permissions profile id.
 # Defaults if config is missing → workspace-write (matches Codex's own default).
@@ -305,6 +304,7 @@ class CodexAppServerSession:
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
         self._interrupt_event = threading.Event()
+        self._interrupt_lock = threading.Lock()
         self._transport_failed = threading.Event()
         self._active_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
@@ -407,7 +407,33 @@ class CodexAppServerSession:
     def request_interrupt(self) -> None:
         """Idempotent: signal the active turn loop to issue turn/interrupt
         and unwind. Called by AIAgent's _interrupt_requested path."""
-        self._interrupt_event.set()
+        interrupt_lock = getattr(self, "_interrupt_lock", None)
+        if interrupt_lock is None:
+            self._interrupt_event.set()
+            return
+        with interrupt_lock:
+            self._interrupt_event.set()
+
+    def consume_interrupt_request(self) -> bool:
+        """Consume one pending session-local interrupt signal, if present.
+
+        The agent-level interrupt flag owns the logical-turn lifecycle.  This
+        event only wakes the app-server polling loop, so callers that finish a
+        logical interrupt without entering that loop must drain it explicitly
+        to keep the next turn from inheriting a stale stop.
+        """
+        interrupt_lock = getattr(self, "_interrupt_lock", None)
+        if interrupt_lock is None:
+            interrupt_event = getattr(self, "_interrupt_event", None)
+            if interrupt_event is None or not interrupt_event.is_set():
+                return False
+            interrupt_event.clear()
+            return True
+        with interrupt_lock:
+            if not self._interrupt_event.is_set():
+                return False
+            self._interrupt_event.clear()
+            return True
 
     def request_steer(self, text: str) -> bool:
         """Append user guidance to the active Codex turn via ``turn/steer``."""
@@ -520,7 +546,7 @@ class CodexAppServerSession:
             # Subprocess almost certainly unhealthy — retire so the next
             # turn re-spawns cleanly.
             result.should_retire = True
-            self._interrupt_event.clear()
+            result.interrupted = self.consume_interrupt_request()
             return result
         assert self._client is not None and self._thread_id is not None
         result.thread_id = self._thread_id
@@ -528,9 +554,8 @@ class CodexAppServerSession:
         # Do not clear here: a hard stop can arrive while ensure_started() is
         # spawning/initializing the subprocess. Honor it before launching a
         # Codex turn instead of erasing the signal.
-        if self._interrupt_event.is_set():
+        if self.consume_interrupt_request():
             result.interrupted = True
-            self._interrupt_event.clear()
             return result
         projector = CodexEventProjector()
 
@@ -563,7 +588,7 @@ class CodexAppServerSession:
                 result.error = self._format_error_with_stderr(
                     "turn/start failed", exc
                 )
-            self._interrupt_event.clear()
+            result.interrupted = self.consume_interrupt_request()
             return result
         except TimeoutError as exc:
             # turn/start hanging is a strong signal the subprocess is wedged.
@@ -573,14 +598,14 @@ class CodexAppServerSession:
                 "turn/start timed out", exc
             )
             result.should_retire = True
-            self._interrupt_event.clear()
+            result.interrupted = self.consume_interrupt_request()
             return result
         except CodexAppServerTransportError as exc:
             result.error = self._format_error_with_stderr(
                 "turn/start transport failed", exc
             )
             result.should_retire = True
-            self._interrupt_event.clear()
+            result.interrupted = self.consume_interrupt_request()
             return result
 
         result.turn_id = (ts.get("turn") or {}).get("id")
@@ -596,7 +621,9 @@ class CodexAppServerSession:
 
         while time.monotonic() < deadline and not turn_complete:
             if self._interrupt_event.is_set():
-                self._issue_interrupt(result.turn_id)
+                result.should_retire = (
+                    self._issue_interrupt(result.turn_id) or result.should_retire
+                )
                 result.interrupted = True
                 break
 
@@ -625,7 +652,9 @@ class CodexAppServerSession:
                 and (time.monotonic() - last_tool_completion_at)
                     > post_tool_quiet_timeout
             ):
-                self._issue_interrupt(result.turn_id)
+                result.should_retire = (
+                    self._issue_interrupt(result.turn_id) or result.should_retire
+                )
                 result.interrupted = True
                 result.error = (
                     f"codex went silent for "
@@ -809,7 +838,9 @@ class CodexAppServerSession:
             # tell the caller to retire the session — a turn that never
             # finished is a strong sign codex is wedged in a way the next
             # turn shouldn't inherit.
-            self._issue_interrupt(result.turn_id)
+            result.should_retire = (
+                self._issue_interrupt(result.turn_id) or result.should_retire
+            )
             result.interrupted = True
             if not result.error:
                 result.error = self._format_error_with_stderr(
@@ -819,7 +850,8 @@ class CodexAppServerSession:
 
         with self._active_turn_lock:
             self._active_turn_id = None
-        self._interrupt_event.clear()
+        if self.consume_interrupt_request():
+            result.interrupted = True
         result.should_retire = result.should_retire or self._transport_failed.is_set()
         return result
 
@@ -848,11 +880,17 @@ class CodexAppServerSession:
                 "codex app-server startup failed", exc
             )
             result.should_retire = True
+            result.interrupted = self.consume_interrupt_request()
             return result
 
         assert self._client is not None and self._thread_id is not None
         result.thread_id = self._thread_id
-        self._interrupt_event.clear()
+
+        # As with a normal turn, startup may overlap a hard stop. Preserve and
+        # honor that signal before launching compaction.
+        if self.consume_interrupt_request():
+            result.interrupted = True
+            return result
         projector = CodexEventProjector()
 
         try:
@@ -871,6 +909,7 @@ class CodexAppServerSession:
                 result.error = self._format_error_with_stderr(
                     "thread/compact/start failed", exc
                 )
+            result.interrupted = self.consume_interrupt_request()
             return result
         except TimeoutError as exc:
             stderr_blob = "\n".join(self._client.stderr_tail(40))
@@ -879,12 +918,14 @@ class CodexAppServerSession:
                 "thread/compact/start timed out", exc
             )
             result.should_retire = True
+            result.interrupted = self.consume_interrupt_request()
             return result
         except CodexAppServerTransportError as exc:
             result.error = self._format_error_with_stderr(
                 "thread/compact/start transport failed", exc
             )
             result.should_retire = True
+            result.interrupted = self.consume_interrupt_request()
             return result
 
         deadline = time.monotonic() + turn_timeout
@@ -892,7 +933,13 @@ class CodexAppServerSession:
 
         while time.monotonic() < deadline and not turn_complete:
             if self._interrupt_event.is_set():
-                self._issue_interrupt(result.turn_id)
+                if result.turn_id is None:
+                    result.error = (
+                        "compact turn interrupted before its turn id was reported"
+                    )
+                result.should_retire = (
+                    self._issue_interrupt(result.turn_id) or result.should_retire
+                )
                 result.interrupted = True
                 break
 
@@ -1020,7 +1067,9 @@ class CodexAppServerSession:
                         )
 
         if not turn_complete and not result.interrupted:
-            self._issue_interrupt(result.turn_id)
+            result.should_retire = (
+                self._issue_interrupt(result.turn_id) or result.should_retire
+            )
             result.interrupted = True
             if not result.error:
                 result.error = self._format_error_with_stderr(
@@ -1029,13 +1078,16 @@ class CodexAppServerSession:
             result.should_retire = True
 
         result.should_retire = result.should_retire or self._transport_failed.is_set()
+        if self.consume_interrupt_request():
+            result.interrupted = True
         return result
 
     # ---------- internals ----------
 
-    def _issue_interrupt(self, turn_id: Optional[str]) -> None:
+    def _issue_interrupt(self, turn_id: Optional[str]) -> bool:
+        """Request cancellation and report whether the session must retire."""
         if self._client is None or self._thread_id is None or turn_id is None:
-            return
+            return True
         try:
             self._client.request(
                 "turn/interrupt",
@@ -1043,13 +1095,22 @@ class CodexAppServerSession:
                 timeout=5,
             )
         except CodexAppServerError as exc:
-            # "no active turn to interrupt" is fine — already done.
-            logger.debug("turn/interrupt non-fatal: %s", exc)
+            if "no active turn" in str(exc.message or "").casefold():
+                # Completion can win the race after our poll but before the
+                # interrupt RPC is handled. The turn is already stopped, so
+                # the persistent thread remains safe to reuse.
+                logger.debug("turn/interrupt found no active turn: %s", exc)
+                return False
+            logger.warning("turn/interrupt was not confirmed: %s", exc)
+            return True
         except TimeoutError:
             logger.warning("turn/interrupt timed out")
+            return True
         except CodexAppServerTransportError:
             self._transport_failed.set()
             logger.debug("turn/interrupt transport unavailable", exc_info=True)
+            return True
+        return False
 
     def _handle_server_request(self, req: dict) -> None:
         """Translate a codex server request (approval) into Hermes' approval

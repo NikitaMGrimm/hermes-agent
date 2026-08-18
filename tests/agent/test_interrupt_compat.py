@@ -87,6 +87,63 @@ def test_inherited_hard_interrupt_bypasses_legacy_subclass_override() -> None:
     assert agent._interrupt_message == "stop now"
 
 
+def test_atomic_interrupt_claim_preserves_later_request() -> None:
+    from run_agent import AIAgent
+
+    class SessionInterrupt:
+        def __init__(self) -> None:
+            self.event = threading.Event()
+
+        def request_interrupt(self) -> None:
+            self.event.set()
+
+        def consume_interrupt_request(self) -> bool:
+            was_set = self.event.is_set()
+            self.event.clear()
+            return was_set
+
+    agent = object.__new__(AIAgent)
+    agent._pending_redirect_lock = threading.RLock()
+    agent._pending_redirect = None
+    agent._pending_steer_lock = threading.Lock()
+    agent._pending_steer = None
+    agent._hard_interrupt_requested = threading.Event()
+    agent._interrupt_requested = False
+    agent._interrupt_message = None
+    agent._interrupt_thread_signal_pending = False
+    agent._execution_thread_id = None
+    agent._tool_worker_threads = set()
+    agent._tool_worker_threads_lock = threading.Lock()
+    agent._active_children = []
+    agent._active_children_lock = threading.Lock()
+    agent.quiet_mode = True
+    agent.api_mode = "codex_app_server"
+    agent._codex_session = SessionInterrupt()
+
+    with agent._pending_redirect_lock:
+        late_interrupt = threading.Thread(
+            target=agent.interrupt,
+            args=("late stop",),
+        )
+        late_interrupt.start()
+        requested, message = agent.consume_interrupt_state()
+        assert requested is False
+        assert message is None
+
+    late_interrupt.join(timeout=2.0)
+
+    assert not late_interrupt.is_alive()
+    assert agent._interrupt_requested is True
+    assert agent._interrupt_message == "late stop"
+    assert agent._codex_session.event.is_set()
+
+    requested, message = agent.consume_interrupt_state()
+
+    assert requested is True
+    assert message == "late stop"
+    assert not agent._codex_session.event.is_set()
+
+
 def test_tui_subagent_interrupt_is_an_explicit_hard_stop() -> None:
     import tools.delegate_tool as delegate_tool
 
