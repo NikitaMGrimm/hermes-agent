@@ -49,6 +49,12 @@ logger = logging.getLogger(__name__)
 # enough to surface a config/provider/auth diagnostic.
 _STDERR_TAIL_LINES = 12
 
+# App-server turns routinely drive long repository checks. Ten minutes is
+# shorter than a normal full gate and caused Hermes to detach while Codex kept
+# working. Keep the default aligned with the trusted-workspace foreground
+# ceiling so a live turn can remain attached for up to 100 minutes.
+DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS = 6000.0
+
 # Permission profile mapping mirrors the docstring in PR proposal:
 # Hermes' tools.terminal.security_mode → Codex's permissions profile id.
 # Defaults if config is missing → workspace-write (matches Codex's own default).
@@ -513,7 +519,7 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
-        turn_timeout: float = 600.0,
+        turn_timeout: float = DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
     ) -> TurnResult:
@@ -858,7 +864,7 @@ class CodexAppServerSession:
     def compact_thread(
         self,
         *,
-        turn_timeout: float = 600.0,
+        turn_timeout: float = DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS,
         notification_poll_timeout: float = 0.25,
     ) -> TurnResult:
         """Trigger Codex-native history compaction for the current thread.

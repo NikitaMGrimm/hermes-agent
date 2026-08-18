@@ -16,6 +16,7 @@ import pytest
 
 import agent.transports.codex_app_server_session as session_mod
 from agent.transports.codex_app_server_session import (
+    DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS,
     CodexAppServerSession,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
@@ -153,6 +154,17 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_default_turn_timeout_matches_trusted_workspace_ceiling(self):
+        assert DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS == 6000.0
+        assert (
+            CodexAppServerSession.run_turn.__kwdefaults__["turn_timeout"]
+            == DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS
+        )
+        assert (
+            CodexAppServerSession.compact_thread.__kwdefaults__["turn_timeout"]
+            == DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS
+        )
+
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
         s = make_session(client)
