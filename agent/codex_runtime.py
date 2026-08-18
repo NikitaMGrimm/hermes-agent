@@ -804,7 +804,15 @@ def run_codex_app_server_turn(
         )
         if callable(consume_session_interrupt):
             consume_session_interrupt()
-        agent.clear_interrupt()
+        clear_interrupt = getattr(agent, "clear_interrupt", None)
+        if callable(clear_interrupt):
+            clear_interrupt()
+        else:
+            # Lightweight integrations may implement only the legacy flag
+            # contract.  Keep that compatibility path atomic from the
+            # caller's perspective without requiring an AIAgent method.
+            agent._interrupt_requested = False
+            agent._interrupt_message = None
         return requested, message
 
     # Native compaction can consume the session-private interrupt event before
