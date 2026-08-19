@@ -165,16 +165,17 @@ that upstream still lacks.
   Response, steer, interrupt, compaction, and finalization paths propagate the
   retirement decision so the next turn starts a fresh App Server process.
   Agent and session interrupt state share one ordered claim boundary so a stop
-  cannot be lost or leak into the next turn. Normal turns and native compaction
-  remain attached for 6,000 seconds rather than detaching after ten minutes
-  while Codex continues working.
+  cannot be lost or leak into the next turn. Normal turns, post-tool completion
+  waits, and native compaction remain attached for 6,000 seconds rather than
+  detaching while Codex continues working.
 - **Removal:** pure upstream must pass
   `tests/agent/transports/test_codex_app_server_runtime.py` and
   `tests/agent/transports/test_codex_app_server_session.py`, including circular
   serialization, `BrokenPipeError` and generic `OSError` writes, short and
   concurrent writes, pending-state cleanup, response write failure,
   steer/finalization races, interrupt failure, compaction failure, and the
-  6,000-second default deadline. Pure upstream must also pass
+  6,000-second turn, post-tool completion, and compaction deadlines. Pure
+  upstream must also pass
   `tests/agent/test_codex_app_server_persist.py`,
   `tests/agent/test_interrupt_compat.py`, and
   `tests/run_agent/test_codex_app_server_integration.py`. Reproduce the

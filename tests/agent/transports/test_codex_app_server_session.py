@@ -161,6 +161,10 @@ class TestLifecycle:
             == DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS
         )
         assert (
+            CodexAppServerSession.run_turn.__kwdefaults__["post_tool_quiet_timeout"]
+            == DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS
+        )
+        assert (
             CodexAppServerSession.compact_thread.__kwdefaults__["turn_timeout"]
             == DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS
         )
